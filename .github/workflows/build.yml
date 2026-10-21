@@ -101,8 +101,9 @@ jobs:
           POST_DEFCONFIG_CMDS=
           DT_OVERLAY_SUPPORT=0
           CONFIG_LITHIUM=y
+          CONFIG_CNSS_QCA6490=y
           CONFIG_TARGET=msm.waipio
-          CONFIG_QCA_CLD_WLAN_PROFILE=default
+          CONFIG_QCA_CLD_WLAN_PROFILE=qca6490
           CONFIG_QCA_CLD_WLAN=m
           CONFIG_QCA_WIFI_ISOC=0
           CONFIG_QCA_WIFI_2_0=1
@@ -143,8 +144,9 @@ jobs:
           POST_DEFCONFIG_CMDS=
           DT_OVERLAY_SUPPORT=0
           CONFIG_LITHIUM=y
+          CONFIG_CNSS_QCA6490=y
           CONFIG_TARGET=msm.waipio
-          CONFIG_QCA_CLD_WLAN_PROFILE=default
+          CONFIG_QCA_CLD_WLAN_PROFILE=qca6490
           CONFIG_QCA_CLD_WLAN=m
           CONFIG_QCA_WIFI_ISOC=0
           CONFIG_QCA_WIFI_2_0=1
