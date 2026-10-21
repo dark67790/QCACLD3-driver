@@ -164,6 +164,14 @@ jobs:
             exit 1
           fi
           cp "$MODULE" "$GITHUB_WORKSPACE/wlan.ko"
+          STRIP_TOOL="$(command -v llvm-strip || true)"
+          if [ -z "$STRIP_TOOL" ]; then
+            STRIP_TOOL="$(find "$GITHUB_WORKSPACE/kernel_platform/prebuilts" "$GITHUB_WORKSPACE/kernel_platform/prebuilts-master" -type f -name llvm-strip -print -quit 2>/dev/null || true)"
+          fi
+          if [ -z "$STRIP_TOOL" ]; then
+            STRIP_TOOL="$(command -v strip)"
+          fi
+          "$STRIP_TOOL" --strip-debug "$GITHUB_WORKSPACE/wlan.ko"
           ls -lh "$GITHUB_WORKSPACE/wlan.ko"
 
       - name: Upload wlan.ko
@@ -172,4 +180,4 @@ jobs:
           name: qcacld3-wlan-ko
           path: wlan.ko
           if-no-files-found: error
-          compression-level: 0
+          compression-level: 6
