@@ -100,6 +100,7 @@ jobs:
           PRE_DEFCONFIG_CMDS=
           POST_DEFCONFIG_CMDS=
           DT_OVERLAY_SUPPORT=0
+          CONFIG_LITHIUM=y
           CONFIG_TARGET=msm.waipio
           CONFIG_QCA_CLD_WLAN_PROFILE=default
           CONFIG_QCA_CLD_WLAN=m
@@ -141,6 +142,7 @@ jobs:
           PRE_DEFCONFIG_CMDS=
           POST_DEFCONFIG_CMDS=
           DT_OVERLAY_SUPPORT=0
+          CONFIG_LITHIUM=y
           CONFIG_TARGET=msm.waipio
           CONFIG_QCA_CLD_WLAN_PROFILE=default
           CONFIG_QCA_CLD_WLAN=m
