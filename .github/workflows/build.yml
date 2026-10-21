@@ -23,7 +23,7 @@ jobs:
           sudo apt-get install -y -qq \
             bc bison flex libssl-dev libelf-dev libncurses-dev dwarves rsync \
             python3-pip unzip git patch coreutils curl perl \
-            build-essential cpio wget zip
+            build-essential cpio wget zip llvm
 
       - name: Download Samsung source and toolchain
         env:
@@ -164,14 +164,26 @@ jobs:
             exit 1
           fi
           cp "$MODULE" "$GITHUB_WORKSPACE/wlan.ko"
-          STRIP_TOOL="$(command -v llvm-strip || true)"
+          STRIP_TOOL="$(find "$GITHUB_WORKSPACE/kernel_platform/prebuilts" "$GITHUB_WORKSPACE/kernel_platform/prebuilts-master" \
+            \( -name llvm-strip -o -name 'llvm-strip-*' \) -print -quit 2>/dev/null || true)"
           if [ -z "$STRIP_TOOL" ]; then
-            STRIP_TOOL="$(find "$GITHUB_WORKSPACE/kernel_platform/prebuilts" "$GITHUB_WORKSPACE/kernel_platform/prebuilts-master" -type f -name llvm-strip -print -quit 2>/dev/null || true)"
+            STRIP_TOOL="$(command -v llvm-strip || true)"
           fi
           if [ -z "$STRIP_TOOL" ]; then
-            STRIP_TOOL="$(command -v strip)"
+            STRIP_TOOL="$(find /usr/bin -maxdepth 1 \( -name llvm-strip -o -name 'llvm-strip-*' \) -print -quit)"
           fi
+          if [ -z "$STRIP_TOOL" ]; then
+            echo "LLVM strip tool was not found"
+            exit 1
+          fi
+          ORIGINAL_SIZE="$(stat -c%s "$GITHUB_WORKSPACE/wlan.ko")"
           "$STRIP_TOOL" --strip-debug "$GITHUB_WORKSPACE/wlan.ko"
+          STRIPPED_SIZE="$(stat -c%s "$GITHUB_WORKSPACE/wlan.ko")"
+          echo "Stripped wlan.ko: $ORIGINAL_SIZE -> $STRIPPED_SIZE bytes"
+          if [ "$STRIPPED_SIZE" -ge "$ORIGINAL_SIZE" ]; then
+            echo "Stripping did not reduce wlan.ko"
+            exit 1
+          fi
           ls -lh "$GITHUB_WORKSPACE/wlan.ko"
 
       - name: Upload wlan.ko
