@@ -83,8 +83,29 @@ def _normalize_for_match(block: str) -> str:
     return escaped
 
 
+def _diagnose(path: Path, needle: str, context_lines: int = 15):
+    """On an anchor miss, locate a much smaller near-certain substring and
+    dump real surrounding file content to the CI log, so we get ground
+    truth from a single run instead of a manual back-and-forth."""
+    text = path.read_text()
+    idx = text.find(needle)
+    if idx == -1:
+        print(f"    DIAGNOSE: needle {needle!r} not found anywhere in file either "
+              f"-- this section may not exist in this tree at all")
+        return
+    line_no = text.count("\n", 0, idx) + 1
+    lines = text.splitlines()
+    start = max(0, line_no - 1 - context_lines // 2)
+    end = min(len(lines), line_no - 1 + context_lines // 2)
+    print(f"    DIAGNOSE: needle found at line {line_no}, real content "
+          f"(lines {start + 1}-{end}):")
+    for i in range(start, end):
+        # render tabs visibly so indentation-only drift is obvious in the log
+        print(f"    {i + 1:>6}\t{lines[i].replace(chr(9), '<TAB>')}")
+
+
 def fuzzy_replace(path: Path, old_block: str, new_block: str, label: str,
-                   required: bool = True):
+                   required: bool = True, diagnose_needle: str = None):
     if not path.exists():
         msg = f"[{label}] file not found: {path}"
         FAILURES.append(msg) if required else print(f"WARN: {msg}")
@@ -100,6 +121,8 @@ def fuzzy_replace(path: Path, old_block: str, new_block: str, label: str,
             FAILURES.append(msg)
         else:
             print(f"WARN: {msg} -- skipping (non-required)")
+        if diagnose_needle:
+            _diagnose(path, diagnose_needle)
         return False
     if len(matches) > 1:
         msg = (f"[{label}] anchor matched {len(matches)} times in {path}, "
@@ -123,7 +146,8 @@ def apply_hand_merges():
         "int hdd_enable_monitor_mode(struct net_device *dev);\n#else",
         "int hdd_enable_monitor_mode(struct net_device *dev);\n"
         "int hdd_disable_monitor_mode(struct net_device *dev);\n#else",
-        "rx_monitor.h decl")
+        "rx_monitor.h decl",
+        diagnose_needle="hdd_enable_monitor_mode(struct net_device *dev);")
     fuzzy_replace(f,
         "static inline int hdd_enable_monitor_mode(struct net_device *dev)\n"
         "{\n\treturn 0;\n}\n#endif /* CONFIG_LITHIUM */",
@@ -131,7 +155,8 @@ def apply_hand_merges():
         "{\n\treturn 0;\n}\n"
         "static inline int hdd_disable_monitor_mode(struct net_device *dev)\n"
         "{\n\treturn 0;\n}\n#endif /* CONFIG_LITHIUM */",
-        "rx_monitor.h stub")
+        "rx_monitor.h stub",
+        diagnose_needle="static inline int hdd_enable_monitor_mode")
 
     # --- rx_monitor.c : conditional include ---
     f = HDD_SRC / "wlan_hdd_rx_monitor.c"
@@ -140,7 +165,8 @@ def apply_hand_merges():
         '#include "wlan_hdd_rx_monitor.h"\n#include "ol_txrx.h"\n'
         '#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n'
         '#include "wlan_hdd_frame_inject.h"\n#endif\n',
-        "rx_monitor.c include")
+        "rx_monitor.c include",
+        diagnose_needle='#include "wlan_hdd_rx_monitor.h"')
 
     # --- cfg80211.c : conditional include + vendor cmd array entry ---
     f = HDD_SRC / "wlan_hdd_cfg80211.c"
@@ -170,7 +196,8 @@ def apply_hand_merges():
         "\tqdf_atomic_t net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX];\n"
         "\n#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n"
         "\tstruct hdd_injection_ctx *injection_ctx;\n#endif\n};",
-        "main.h injection_ctx field")
+        "main.h injection_ctx field",
+        diagnose_needle="net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX]")
 
     # --- main.c : __hdd_mon_open -- set carrier/queues up, keep existing
     #     BBM policy block this tree already has that the patch's baseline
@@ -323,4 +350,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
