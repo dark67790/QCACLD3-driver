@@ -94,7 +94,7 @@ jobs:
           ./build/build.sh
 
           test -f out/qcacld3/msm-kernel/.config
-          touch out/qcacld3/msm-kernel/Module.symvers
+          touch out/qcacld3/dist/Module.symvers
 
       - name: Build QCACLD3 only
         working-directory: kernel_platform
