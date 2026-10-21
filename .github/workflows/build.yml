@@ -75,6 +75,10 @@ jobs:
           test -d vendor/qcom/opensource/wlan/qcacld-3.0
           test -d vendor/qcom/opensource/wlan/qca-wifi-host-cmn
 
+      - name: Apply packet injection patch + tree-specific fixups
+        run: |
+          python3 patches/apply_injection_patch.py
+
       - name: Prepare kernel headers for external module
         working-directory: kernel_platform
         run: |
@@ -150,6 +154,7 @@ jobs:
           CONFIG_QCA_CLD_WLAN=m
           CONFIG_QCA_WIFI_ISOC=0
           CONFIG_QCA_WIFI_2_0=1
+          CONFIG_FEATURE_FRAME_INJECTION_SUPPORT=y
           unset ANDROID_BUILD_TOP
           CONFIG
 
@@ -193,3 +198,4 @@ jobs:
           path: wlan.ko
           if-no-files-found: error
           compression-level: 6
+
