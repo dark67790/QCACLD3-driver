@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install build dependencies
         run: |
@@ -49,6 +51,23 @@ jobs:
           unzip -q samsung.zip
           tar -xf Kernel.tar.gz
           tar -xf Platform.tar.gz
+
+          # Samsung's header closes its include guard before the fallback
+          # TPC helpers, so repeated includes redefine those static inlines.
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          header = Path("vendor/qcom/opensource/wlan/qcacld-3.0/components/mlme/core/inc/wlan_mlme_main.h")
+          source = header.read_text()
+          # Match the function declaration independent of its indentation.
+          import re
+          pattern = r"(struct qdf_mac_addr \*self_mac\);\n)#endif\n(#ifdef CONFIG_BAND_6GHZ\b)"
+          source, count = re.subn(pattern, r"\1\2", source, count=1)
+          if count != 1 or not source.endswith("#endif\n"):
+              raise SystemExit("Unexpected wlan_mlme_main.h layout")
+          source = source.rstrip() + "\n\n#endif /* _WLAN_MLME_MAIN_H_ */\n"
+          header.write_text(source)
+          PYTHON
+
           rm samsung.zip Kernel.tar.gz Platform.tar.gz
           tar -xzf toolchain.tar.gz -C kernel_platform/
           rm toolchain.tar.gz
