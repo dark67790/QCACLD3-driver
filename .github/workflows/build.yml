@@ -158,7 +158,7 @@ jobs:
           KERNEL_KIT="$GITHUB_WORKSPACE/kernel_platform/out/qcacld3" \
           ./build/build_module.sh
 
-          MODULE="$(find out/qcacld3-module -type f -name wlan.ko -print -quit)"
+          MODULE="$(find "$GITHUB_WORKSPACE/vendor/qcom/opensource/wlan/qcacld-3.0" -type f -name wlan.ko -print -quit)"
           if [ -z "$MODULE" ]; then
             echo "wlan.ko was not produced"
             exit 1
