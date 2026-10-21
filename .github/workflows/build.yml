@@ -15,40 +15,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Free disk space
-        uses: endersonmenezes/free-disk-space@v3
-        with:
-          remove_android: true
-          remove_dotnet: true
-          remove_haskell: true
-          remove_tool_cache: true
-          remove_swap: true
-          remove_packages: >
-            azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable
-            firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*
-          remove_packages_one_command: true
-          remove_folders: >
-            /usr/share/swift /usr/share/miniconda /usr/share/az*
-            /usr/local/lib/node_modules /usr/local/share/chromium
-            /usr/local/share/powershell /usr/local/julia
-            /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle
-          rm_cmd: rmz
-          rmz_version: "3.1.1"
-          testing: false
-
-      - name: Set up swap
-        run: |
-          sudo fallocate -l 12G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          free -h
-
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            bc bison flex libssl-dev libelf-dev \
+            bc bison flex libssl-dev libelf-dev libncurses-dev dwarves rsync \
             python3-pip unzip git patch coreutils curl perl \
             build-essential cpio wget zip
 
@@ -84,44 +55,91 @@ jobs:
 
           test -d vendor/qcom/opensource/wlan/qcacld-3.0
           test -d vendor/qcom/opensource/wlan/qca-wifi-host-cmn
-          test -f build_kernel_GKI.sh
 
-      - name: Build QCACLD3 module
+      - name: Prepare kernel headers for external module
+        working-directory: kernel_platform
         run: |
-          sed -i 's/BUILD_TARGET=q4q_kor_singlex/BUILD_TARGET=q4q_eur_openx/' \
-            build_kernel_GKI.sh
+          cat > build.config.qcacld3-prepare <<'CONFIG'
+          KERNEL_DIR=./msm-kernel
+          VARIANT=gki
+          TARGET_BUILD_VARIANT=user
+          . ./msm-kernel/build.config.msm.waipio.sec
+          MAKE_GOALS="modules_prepare"
+          GKI_BUILD_CONFIG=
+          IN_KERNEL_MODULES=
+          BUILD_INITRAMFS=
+          BUILD_BOOT_IMG=
+          BUILD_VENDOR_DLKM=
+          KMI_ENFORCED=
+          KMI_SYMBOL_LIST=
+          ABI_DEFINITION=
+          MODULES_ORDER=
+          EXT_MODULES=
+          KBUILD_EXT_MODULES=
+          DIST_CMDS=
+          SKIP_CP_KERNEL_HDR=1
+          PRE_DEFCONFIG_CMDS=
+          POST_DEFCONFIG_CMDS=
+          DT_OVERLAY_SUPPORT=0
+          CONFIG_TARGET=msm.waipio
+          CONFIG_QCA_CLD_WLAN_PROFILE=default
+          CONFIG_QCA_CLD_WLAN=m
+          CONFIG_QCA_WIFI_ISOC=0
+          CONFIG_QCA_WIFI_2_0=1
+          unset ANDROID_BUILD_TOP
+          CONFIG
 
-          python3 - <<'PY'
-          from pathlib import Path
+          OUT_DIR="$GITHUB_WORKSPACE/kernel_platform/out/qcacld3" \
+          BUILD_CONFIG=build.config.qcacld3-prepare \
+          ./build/build.sh
 
-          path = Path("build_kernel_GKI.sh")
-          lines = path.read_text().splitlines()
-          matches = [i for i, line in enumerate(lines)
-                     if line.startswith("export KBUILD_EXT_MODULES=")]
-          if len(matches) != 1:
-              raise SystemExit("Expected exactly one KBUILD_EXT_MODULES export")
-          lines[matches[0]] = (
-              'export KBUILD_EXT_MODULES="../vendor/qcom/opensource/wlan/qcacld-3.0"'
-          )
-          lines = [line for line in lines if line != "export MODNAME=audio_dlkm"]
-          path.write_text("\n".join(lines) + "\n")
-          PY
+          test -f out/qcacld3/msm-kernel/.config
+          touch out/qcacld3/msm-kernel/Module.symvers
 
-          mkdir -p out/vendor/qcom/opensource/mmrm-driver/
-          touch out/vendor/qcom/opensource/mmrm-driver/Module.symvers
+      - name: Build QCACLD3 only
+        working-directory: kernel_platform
+        run: |
+          cat > build.config.qcacld3-module <<'CONFIG'
+          KERNEL_DIR=./msm-kernel
+          VARIANT=gki
+          TARGET_BUILD_VARIANT=user
+          . ./msm-kernel/build.config.msm.waipio.sec
+          MAKE_GOALS="modules_prepare"
+          GKI_BUILD_CONFIG=
+          IN_KERNEL_MODULES=
+          BUILD_INITRAMFS=
+          BUILD_BOOT_IMG=
+          BUILD_VENDOR_DLKM=
+          KMI_ENFORCED=
+          KMI_SYMBOL_LIST=
+          ABI_DEFINITION=
+          MODULES_ORDER=
+          EXT_MODULES="../vendor/qcom/opensource/wlan/qcacld-3.0"
+          KBUILD_EXT_MODULES=
+          KBUILD_OPTIONS="KBUILD_MODPOST_WARN=1"
+          DIST_CMDS=
+          SKIP_CP_KERNEL_HDR=1
+          PRE_DEFCONFIG_CMDS=
+          POST_DEFCONFIG_CMDS=
+          DT_OVERLAY_SUPPORT=0
+          CONFIG_TARGET=msm.waipio
+          CONFIG_QCA_CLD_WLAN_PROFILE=default
+          CONFIG_QCA_CLD_WLAN=m
+          CONFIG_QCA_WIFI_ISOC=0
+          CONFIG_QCA_WIFI_2_0=1
+          unset ANDROID_BUILD_TOP
+          CONFIG
 
-          bash build_kernel_GKI.sh
+          OUT_DIR="$GITHUB_WORKSPACE/kernel_platform/out/qcacld3-module" \
+          BUILD_CONFIG=build.config.qcacld3-module \
+          KERNEL_KIT="$GITHUB_WORKSPACE/kernel_platform/out/qcacld3" \
+          ./build/build_module.sh
 
-          MODULE="$(find out -type f -path '*/dist/*' -name wlan.ko -print -quit)"
-          if [ -z "$MODULE" ]; then
-            MODULE="$(find out -type f -name wlan.ko -print -quit)"
-          fi
+          MODULE="$(find out/qcacld3-module -type f -name wlan.ko -print -quit)"
           if [ -z "$MODULE" ]; then
             echo "wlan.ko was not produced"
-            find out -type f -name '*.ko' -print | head -100
             exit 1
           fi
-
           cp "$MODULE" "$GITHUB_WORKSPACE/wlan.ko"
           ls -lh "$GITHUB_WORKSPACE/wlan.ko"
 
