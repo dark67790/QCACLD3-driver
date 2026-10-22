@@ -435,6 +435,60 @@ def apply_hand_merges():
         "\t}\n\n\treturn status;",
         "wma_utils.c del_bss_resp alloc")
 
+    # --- Kbuild : wire the new object files + cppflag into the build.
+    #     Three separate insertion points, confirmed against real file
+    #     content (patch's own hunks reported "Reversed or previously
+    #     applied" against this tree, so its context can't be trusted --
+    #     these three anchors were pulled directly from the real file). ---
+    f = QCACLD / "Kbuild"
+    if already_present(f, "CONFIG_FEATURE_FRAME_INJECTION_SUPPORT), y)"):
+        print("[Kbuild] already present -- skipping")
+    else:
+        fuzzy_replace(f,
+            "ifeq ($(CONFIG_FEATURE_MONITOR_MODE_SUPPORT), y)\n"
+            "HDD_OBJS += $(HDD_SRC_DIR)/wlan_hdd_rx_monitor.o\n"
+            "endif\n",
+            "ifeq ($(CONFIG_FEATURE_MONITOR_MODE_SUPPORT), y)\n"
+            "HDD_OBJS += $(HDD_SRC_DIR)/wlan_hdd_rx_monitor.o\n"
+            "endif\n"
+            "\n"
+            "ifeq ($(CONFIG_FEATURE_FRAME_INJECTION_SUPPORT), y)\n"
+            "HDD_OBJS += $(HDD_SRC_DIR)/wlan_hdd_frame_inject.o\n"
+            "HDD_OBJS += $(HDD_SRC_DIR)/wlan_hdd_frame_validate.o\n"
+            "HDD_OBJS += $(HDD_SRC_DIR)/wlan_hdd_inject_security.o\n"
+            "HDD_OBJS += $(HDD_SRC_DIR)/wlan_hdd_frame_inject_debug.o\n"
+            "ifeq ($(CONFIG_WLAN_UNIT_TEST), y)\n"
+            "HDD_OBJS += $(HDD_SRC_DIR)/wlan_hdd_frame_validate_test.o\n"
+            "endif\n"
+            "endif\n",
+            "Kbuild HDD_OBJS",
+            diagnose_needle="HDD_OBJS += $(HDD_SRC_DIR)/wlan_hdd_rx_monitor.o")
+
+        fuzzy_replace(f,
+            "\t\t$(WMA_NDP_OBJS)\n",
+            "\t\t$(WMA_NDP_OBJS)\n"
+            "\n"
+            "ifeq ($(CONFIG_FEATURE_FRAME_INJECTION_SUPPORT), y)\n"
+            "WMA_OBJS += $(WMA_SRC_DIR)/wma_frame_inject.o\n"
+            "endif\n",
+            "Kbuild WMA_OBJS",
+            diagnose_needle="$(WMA_NDP_OBJS)")
+
+        fuzzy_replace(f,
+            "else\n"
+            "cppflags-y += -DDISABLE_MON_CONFIG\n"
+            "endif\n",
+            "else\n"
+            "cppflags-y += -DDISABLE_MON_CONFIG\n"
+            "endif\n"
+            "\n"
+            "ifeq ($(CONFIG_FEATURE_FRAME_INJECTION_SUPPORT), y)\n"
+            "cppflags-y += -DFEATURE_FRAME_INJECTION_SUPPORT\n"
+            "CONFIG_FEATURE_MONITOR_MODE_SUPPORT := y\n"
+            "endif\n",
+            "Kbuild cppflags",
+            diagnose_needle="cppflags-y += -DDISABLE_MON_CONFIG")
+
     # --- default_defconfig : enable the feature flag ---
     f = CONFIGS / "default_defconfig"
     fuzzy_replace(f,
