@@ -46,6 +46,7 @@ CONFIGS = QCACLD / "configs"
 PATCH_FILE = Path(__file__).resolve().parent / "07_packet_injection.patch"
 
 FAILURES = []
+ATTEMPTED_FILES = set()  # files this script has any hand-merge logic for at all
 
 
 def run_bulk_patch():
@@ -58,7 +59,7 @@ def run_bulk_patch():
     result = subprocess.run(
         [
             "patch", "-p3", "--forward", "--no-backup-if-mismatch",
-            "--fuzz=0", "-i", str(PATCH_FILE),
+            "--fuzz=2", "-i", str(PATCH_FILE),
         ],
         cwd=WLAN_DIR, capture_output=True, text=True,
     )
@@ -110,6 +111,7 @@ def already_present(path: Path, needle: str) -> bool:
     match due to surrounding tree-specific content). Check for the smallest
     reliable signal before attempting a hand-merge, so already-applied work
     isn't misreported as a failure."""
+    ATTEMPTED_FILES.add(path.resolve())
     if not path.exists():
         return False
     return needle in path.read_text()
@@ -117,6 +119,7 @@ def already_present(path: Path, needle: str) -> bool:
 
 def fuzzy_replace(path: Path, old_block: str, new_block: str, label: str,
                    required: bool = True, diagnose_needle: str = None):
+    ATTEMPTED_FILES.add(path.resolve())
     if not path.exists():
         msg = f"[{label}] file not found: {path}"
         FAILURES.append(msg) if required else print(f"WARN: {msg}")
@@ -146,6 +149,38 @@ def fuzzy_replace(path: Path, old_block: str, new_block: str, label: str,
     path.write_text(new_text)
     print(f"[{label}] applied -> {path.relative_to(REPO_ROOT)}")
     return True
+
+
+def dump_rejects():
+    """Dump full ground-truth context for every remaining .rej file in one
+    pass: the literal expected hunk plus the real file's actual content at
+    that location. Runs after Step 1 so any NEW divergence (files we have
+    no hand-merge fix for yet) surfaces in this run's log instead of
+    requiring another manual round-trip."""
+    rejects = sorted(WLAN_DIR.rglob("*.rej"))
+    if not rejects:
+        print("\n(no .rej files after bulk patch step -- nothing to diagnose)")
+        return
+    print(f"\n{'=' * 60}\nDIAGNOSING {len(rejects)} REMAINING .rej FILE(S)\n{'=' * 60}")
+    for rej in rejects:
+        target = rej.with_suffix("")  # strip trailing .rej
+        print(f"\n--- {rej.relative_to(WLAN_DIR)} ---")
+        rej_text = rej.read_text()
+        print("EXPECTED (literal hunk from patch):")
+        print(rej_text)
+        if not target.exists():
+            print(f"    (target {target} not found -- can't show real content)")
+            continue
+        lines = target.read_text().splitlines()
+        starts = [int(m.group(1)) for m in
+                  re.finditer(r"^@@ -(\d+),\d+ \+\d+,\d+ @@", rej_text, re.M)]
+        for start_line in starts:
+            lo = max(0, start_line - 1 - 10)
+            hi = min(len(lines), start_line - 1 + 25)
+            print(f"REAL CONTENT in {target.name} around original line "
+                  f"{start_line} (showing {lo + 1}-{hi}):")
+            for i in range(lo, hi):
+                print(f"  {i + 1:>6}\t{lines[i].replace(chr(9), '<TAB>')}")
 
 
 def apply_hand_merges():
@@ -196,52 +231,22 @@ def apply_hand_merges():
     #     QDF_MONITOR_MODE) to reach the monitor adapter without a dev
     #     pointer in scope -- the same idiom this tree already uses
     #     elsewhere (wlan_hdd_state_ctrl_param_write) to find it. ---
-    fuzzy_replace(f,
-        "/**\n"
-        " * hdd_disable_monitor_mode() - Disable monitor mode\n"
-        " * @dev: Pointer to the net_device structure\n"
-        " *\n"
-        " * This function disables monitor mode configuration on the hardware\n"
-        " * and also disables frame injection if it was enabled.\n"
-        " *\n"
-        " * Return: 0 for success; non-zero for failure\n"
-        " */\n"
-        "int hdd_disable_monitor_mode(struct net_device *dev)\n"
-        "{\n"
-        "\tvoid *soc = cds_get_context(QDF_MODULE_ID_SOC);\n"
-        "\tuint8_t vdev_id;\n"
-        "\tint ret;\n"
-        "#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n"
-        "\tstruct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(dev);\n"
-        "#endif\n"
-        "\n"
-        "\thdd_enter_dev(dev);\n"
-        "\n"
-        "\tvdev_id = cdp_get_mon_vdev_from_pdev(soc, OL_TXRX_PDEV_ID);\n"
-        "\tif (vdev_id < 0)\n"
-        "\t\treturn -EINVAL;\n"
-        "\n"
-        "#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n"
-        "\t/* Disable frame injection when monitor mode is disabled */\n"
-        "\tif (adapter) {\n"
-        "\t\tif (QDF_IS_STATUS_ERROR(hdd_frame_inject_disable(adapter))) {\n"
-        "\t\t\thdd_warn(\"Failed to disable frame injection\");\n"
-        "\t\t\t/* Continue with monitor mode disable */\n"
-        "\t\t}\n"
-        "\t}\n"
-        "#endif\n"
-        "\n"
-        "\tret = cdp_set_monitor_mode(soc, vdev_id, true);\n"
-        "\n"
-        "\treturn ret;\n"
-        "}\n"
-        "\n"
+    # The patch's own duplicate (struct net_device *dev) version may or may
+    # not have landed depending on fuzz tolerance in Step 1 -- handle both
+    # outcomes instead of assuming one. Either way the end state should be:
+    # exactly one hdd_disable_monitor_mode(void), with frame-inject-disable
+    # spliced in via hdd_get_adapter(hdd_ctx, QDF_MONITOR_MODE).
+    splice_marker = "hdd_get_adapter(hdd_ctx, QDF_MONITOR_MODE)"
+    dup_marker = "int hdd_disable_monitor_mode(struct net_device *dev)"
+    void_fn = (
         "int hdd_disable_monitor_mode(void)\n"
         "{\n"
         "\tvoid *soc = cds_get_context(QDF_MODULE_ID_SOC);\n"
         "\n"
         "\treturn cdp_reset_monitor_mode(soc, OL_TXRX_PDEV_ID, false);\n"
-        "}\n",
+        "}\n"
+    )
+    spliced_void_fn = (
         "int hdd_disable_monitor_mode(void)\n"
         "{\n"
         "\tvoid *soc = cds_get_context(QDF_MODULE_ID_SOC);\n"
@@ -261,9 +266,65 @@ def apply_hand_merges():
         "#endif\n"
         "\n"
         "\treturn cdp_reset_monitor_mode(soc, OL_TXRX_PDEV_ID, false);\n"
-        "}\n",
-        "rx_monitor.c remove duplicate hdd_disable_monitor_mode, splice into real fn",
-        diagnose_needle="int hdd_disable_monitor_mode(struct net_device *dev)")
+        "}\n"
+    )
+
+    if already_present(f, splice_marker):
+        print("[rx_monitor.c disable-mode splice] already present -- skipping")
+    elif already_present(f, dup_marker):
+        # fuzzy match let the patch's conflicting duplicate land -- remove
+        # it entirely (confirmed unused anywhere in the 44-file patch) and
+        # splice into the real function in one combined edit.
+        dup_fn = (
+            "/**\n"
+            " * hdd_disable_monitor_mode() - Disable monitor mode\n"
+            " * @dev: Pointer to the net_device structure\n"
+            " *\n"
+            " * This function disables monitor mode configuration on the hardware\n"
+            " * and also disables frame injection if it was enabled.\n"
+            " *\n"
+            " * Return: 0 for success; non-zero for failure\n"
+            " */\n"
+            "int hdd_disable_monitor_mode(struct net_device *dev)\n"
+            "{\n"
+            "\tvoid *soc = cds_get_context(QDF_MODULE_ID_SOC);\n"
+            "\tuint8_t vdev_id;\n"
+            "\tint ret;\n"
+            "#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n"
+            "\tstruct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(dev);\n"
+            "#endif\n"
+            "\n"
+            "\thdd_enter_dev(dev);\n"
+            "\n"
+            "\tvdev_id = cdp_get_mon_vdev_from_pdev(soc, OL_TXRX_PDEV_ID);\n"
+            "\tif (vdev_id < 0)\n"
+            "\t\treturn -EINVAL;\n"
+            "\n"
+            "#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n"
+            "\t/* Disable frame injection when monitor mode is disabled */\n"
+            "\tif (adapter) {\n"
+            "\t\tif (QDF_IS_STATUS_ERROR(hdd_frame_inject_disable(adapter))) {\n"
+            "\t\t\thdd_warn(\"Failed to disable frame injection\");\n"
+            "\t\t\t/* Continue with monitor mode disable */\n"
+            "\t\t}\n"
+            "\t}\n"
+            "#endif\n"
+            "\n"
+            "\tret = cdp_set_monitor_mode(soc, vdev_id, true);\n"
+            "\n"
+            "\treturn ret;\n"
+            "}\n"
+            "\n"
+        )
+        fuzzy_replace(f, dup_fn + void_fn, spliced_void_fn,
+                      "rx_monitor.c remove duplicate, splice into real fn",
+                      diagnose_needle=dup_marker)
+    else:
+        # Common case under tighter fuzz: the duplicate never landed, the
+        # tree's original single function is untouched -- extend it directly.
+        fuzzy_replace(f, void_fn, spliced_void_fn,
+                      "rx_monitor.c splice into existing fn (no duplicate present)",
+                      diagnose_needle="int hdd_disable_monitor_mode(void)")
 
     # --- cfg80211.c : conditional include + vendor cmd array entry ---
     f = HDD_SRC / "wlan_hdd_cfg80211.c"
@@ -291,13 +352,14 @@ def apply_hand_merges():
     if already_present(f, "struct hdd_injection_ctx *injection_ctx;"):
         print("[main.h injection_ctx field] already present -- skipping")
     else:
+        # Confirmed stable across two independent runs: this single line is
+        # a reliable anchor regardless of what surrounds it (field order /
+        # #ifdef blocks around it drift between runs/snapshots, this doesn't).
         fuzzy_replace(f,
-            "\tbool delete_in_progress;\n"
-            "\tqdf_atomic_t net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX];\n};",
-            "\tbool delete_in_progress;\n"
+            "\tqdf_atomic_t net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX];\n",
             "\tqdf_atomic_t net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX];\n"
-            "\n#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n"
-            "\tstruct hdd_injection_ctx *injection_ctx;\n#endif\n};",
+            "#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n"
+            "\tstruct hdd_injection_ctx *injection_ctx;\n#endif\n",
             "main.h injection_ctx field",
             diagnose_needle="net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX]")
 
@@ -412,6 +474,20 @@ def apply_hand_merges():
         "tx_rx.c netif_queue_control monitor guard")
 
 
+def check_unaddressed_rejects():
+    """Flag any .rej whose target file has NO hand-merge logic at all in
+    this script, so an unknown divergence doesn't get silently wiped by
+    cleanup() and mistaken for a clean run."""
+    for rej in sorted(WLAN_DIR.rglob("*.rej")):
+        target = rej.with_suffix("").resolve()
+        if target not in ATTEMPTED_FILES:
+            FAILURES.append(
+                f"[unaddressed] {rej.relative_to(WLAN_DIR)} -- no hand-merge "
+                f"logic exists for this file yet, see dump_rejects() output "
+                f"above for ground truth"
+            )
+
+
 def cleanup():
     removed = 0
     for pattern in ("*.rej", "*.orig"):
@@ -419,12 +495,15 @@ def cleanup():
             p.unlink()
             removed += 1
     if removed:
-        print(f"\nRemoved {removed} leftover .rej/.orig file(s)")
+        print(f"\nRemoved {removed} leftover .rej/.orig file(s) "
+              f"(see FAILED list below if any were never addressed)")
 
 
 def main():
     run_bulk_patch()
+    dump_rejects()
     apply_hand_merges()
+    check_unaddressed_rejects()
     cleanup()
 
     print("\n" + "=" * 60)
