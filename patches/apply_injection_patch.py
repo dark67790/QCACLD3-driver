@@ -183,6 +183,92 @@ def dump_rejects():
                 print(f"  {i + 1:>6}\t{lines[i].replace(chr(9), '<TAB>')}")
 
 
+KEYWORD_BLACKLIST = {
+    "if", "for", "while", "switch", "else", "do", "return", "typedef",
+    "struct", "enum", "union", "sizeof", "case", "goto", "break",
+    "continue", "static_assert", "default",
+}
+
+
+def find_function_definitions(text: str):
+    """Heuristic scan for column-0 (non-indented) C function definitions,
+    tolerating multi-line parameter lists. Not a real parser -- intended to
+    catch the specific bug class we've hit twice now (the patch defining a
+    function that collides with one this tree already has), not to be a
+    general-purpose static analyzer."""
+    lines = text.split("\n")
+    defs = []
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if line and line[0] not in (" ", "\t", "#", "/", "*", "}", "{", ";"):
+            sig_lines = [line]
+            j = i
+            found_close = line.rstrip().endswith(")")
+            has_semicolon = ";" in line
+            while not found_close and not has_semicolon and j + 1 < n and j - i < 10:
+                j += 1
+                sig_lines.append(lines[j])
+                if ";" in lines[j]:
+                    has_semicolon = True
+                    break
+                if lines[j].rstrip().endswith(")"):
+                    found_close = True
+                    break
+            if found_close and not has_semicolon:
+                k = j + 1
+                while k < n and lines[k].strip() == "":
+                    k += 1
+                if k < n and lines[k].strip() == "{":
+                    sig_text = " ".join(s.strip() for s in sig_lines)
+                    m = re.match(
+                        r"^(?:static\s+)?(?:inline\s+)?(?:const\s+)?"
+                        r"[A-Za-z_][\w\s\*]*?\b([A-Za-z_]\w*)\s*\(",
+                        sig_text)
+                    if m and m.group(1) not in KEYWORD_BLACKLIST:
+                        defs.append((m.group(1), i + 1))
+                    i = k
+        i += 1
+    return defs
+
+
+def scan_for_duplicate_functions():
+    """Scan every .c file this patch touches for duplicate top-level
+    function definitions -- the exact bug class behind both the
+    hdd_disable_monitor_mode and wlan_hdd_cfg80211_get_channel failures.
+    Runs after hand-merges so it reflects the final patched state, and
+    reports everything in one pass instead of one `make` failure at a time."""
+    print(f"\n{'=' * 60}\nSCANNING FOR DUPLICATE FUNCTION DEFINITIONS\n{'=' * 60}")
+    touched = sorted(set(
+        m.group(1) for m in re.finditer(
+            r"^diff --git a/drivers/staging/(\S+\.c) ",
+            PATCH_FILE.read_text(), re.M)
+    ))
+    any_found = False
+    for rel in touched:
+        c_file = WLAN_DIR / rel
+        if not c_file.exists():
+            continue
+        try:
+            text = c_file.read_text()
+        except Exception as e:
+            print(f"  (couldn't read {rel}: {e})")
+            continue
+        defs = find_function_definitions(text)
+        seen = {}
+        for name, line_no in defs:
+            seen.setdefault(name, []).append(line_no)
+        for name, lines_list in sorted(seen.items()):
+            if len(lines_list) > 1:
+                any_found = True
+                msg = (f"[duplicate-definition] '{name}' defined "
+                       f"{len(lines_list)}x in {rel} at lines {lines_list}")
+                FAILURES.append(msg)
+                print(f"  !! {msg}")
+    if not any_found:
+        print(f"  none found across {len(touched)} patched .c file(s) -- clean")
+
+
 def apply_hand_merges():
     print("\n== Step 2: hand-merged fixes for hunks that diverged from baseline ==")
 
@@ -489,6 +575,101 @@ def apply_hand_merges():
             "Kbuild cppflags",
             diagnose_needle="cppflags-y += -DDISABLE_MON_CONFIG")
 
+    # --- cfg80211.c : the patch adds its own simplified
+    #     wlan_hdd_cfg80211_get_channel(), which collides with this tree's
+    #     own, more complete SSR-safe wrapper (__wlan_hdd_cfg80211_get_channel
+    #     + osif_vdev_sync_op_start/stop pattern) of the same name. Confirmed
+    #     via a live compile error (redefinition). Identify the patch's
+    #     version by its distinctive docstring text (unique to this patch,
+    #     not generic CAF prose) rather than line numbers, since those drift.
+    #     .get_channel isn't on frame-injection's critical path (pure
+    #     userspace channel introspection), so deleting it outright is safe
+    #     -- no need to port its mon_chan_freq fallback into the real fn. ---
+    f = HDD_SRC / "wlan_hdd_cfg80211.c"
+    patch_get_channel_marker = "so that tools like aireplay-ng / mdk3 can determine the current channel."
+    if not already_present(f, patch_get_channel_marker):
+        print("[cfg80211.c get_channel dedup] patch's duplicate not present -- skipping")
+    else:
+        fuzzy_replace(f,
+            "#ifdef FEATURE_MONITOR_MODE_SUPPORT\n"
+            "/**\n"
+            " * wlan_hdd_cfg80211_get_channel() - Report current operating channel\n"
+            " * @wiphy: wiphy handle\n"
+            " * @wdev: wireless_dev handle\n"
+            " * @chandef: output channel definition\n"
+            " *\n"
+            " * Required by nl80211 (NL80211_CMD_GET_INTERFACE) and wext (SIOCGIWFREQ)\n"
+            " * so that tools like aireplay-ng / mdk3 can determine the current channel.\n"
+            " *\n"
+            " * Return: 0 on success, -ENODATA if no channel is set.\n"
+            " */\n"
+            "static int wlan_hdd_cfg80211_get_channel(struct wiphy *wiphy,\n"
+            "\t\t\t\t\t struct wireless_dev *wdev,\n"
+            "\t\t\t\t\t struct cfg80211_chan_def *chandef)\n"
+            "{\n"
+            "\tstruct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(wdev->netdev);\n"
+            "\tstruct hdd_station_ctx *sta_ctx;\n"
+            "\tstruct hdd_mon_set_ch_info *ch_info;\n"
+            "\tstruct ieee80211_channel *chan;\n"
+            "\tuint32_t freq;\n"
+            "\n"
+            "\tif (!adapter)\n"
+            "\t\treturn -ENODATA;\n"
+            "\n"
+            "\tfreq = adapter->mon_chan_freq;\n"
+            "\n"
+            "\tif (!freq) {\n"
+            "\t\tsta_ctx = WLAN_HDD_GET_STATION_CTX_PTR(adapter);\n"
+            "\t\tch_info = &sta_ctx->ch_info;\n"
+            "\t\tfreq = ch_info->freq;\n"
+            "\t}\n"
+            "\n"
+            "\tif (!freq)\n"
+            "\t\treturn -ENODATA;\n"
+            "\n"
+            "\tchan = ieee80211_get_channel(wiphy, freq);\n"
+            "\tif (!chan)\n"
+            "\t\treturn -ENODATA;\n"
+            "\n"
+            "\tcfg80211_chandef_create(chandef, chan, NL80211_CHAN_NO_HT);\n"
+            "\n"
+            "\tswitch (adapter->mon_bandwidth) {\n"
+            "\tcase CH_WIDTH_40MHZ:\n"
+            "\t\tchandef->width = NL80211_CHAN_WIDTH_40;\n"
+            "\t\tbreak;\n"
+            "\tcase CH_WIDTH_80MHZ:\n"
+            "\t\tchandef->width = NL80211_CHAN_WIDTH_80;\n"
+            "\t\tbreak;\n"
+            "\tcase CH_WIDTH_160MHZ:\n"
+            "\t\tchandef->width = NL80211_CHAN_WIDTH_160;\n"
+            "\t\tbreak;\n"
+            "\tdefault:\n"
+            "\t\tbreak;\n"
+            "\t}\n"
+            "\n"
+            "\treturn 0;\n"
+            "}\n"
+            "\n",
+            "#ifdef FEATURE_MONITOR_MODE_SUPPORT\n",
+            "cfg80211.c remove duplicate get_channel",
+            diagnose_needle=patch_get_channel_marker)
+
+        # Drop one of the two identical .get_channel = ... designated
+        # initializers in wlan_hdd_cfg80211_ops (disambiguate via the
+        # unique neighboring .set_monitor_channel line; keep the
+        # unconditional one near .get_antenna so get_channel always works,
+        # not only when FEATURE_MONITOR_MODE_SUPPORT is on).
+        fuzzy_replace(f,
+            "#ifdef FEATURE_MONITOR_MODE_SUPPORT\n"
+            "\t.set_monitor_channel = wlan_hdd_cfg80211_set_mon_ch,\n"
+            "\t.get_channel = wlan_hdd_cfg80211_get_channel,\n"
+            "#endif\n",
+            "#ifdef FEATURE_MONITOR_MODE_SUPPORT\n"
+            "\t.set_monitor_channel = wlan_hdd_cfg80211_set_mon_ch,\n"
+            "#endif\n",
+            "cfg80211.c remove duplicate .get_channel struct entry",
+            diagnose_needle=".set_monitor_channel = wlan_hdd_cfg80211_set_mon_ch,")
+
     # --- default_defconfig : enable the feature flag ---
     f = CONFIGS / "default_defconfig"
     fuzzy_replace(f,
@@ -558,6 +739,7 @@ def main():
     dump_rejects()
     apply_hand_merges()
     check_unaddressed_rejects()
+    scan_for_duplicate_functions()
     cleanup()
 
     print("\n" + "=" * 60)
