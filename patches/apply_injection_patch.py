@@ -58,7 +58,7 @@ def run_bulk_patch():
     result = subprocess.run(
         [
             "patch", "-p3", "--forward", "--no-backup-if-mismatch",
-            "--fuzz=3", "-i", str(PATCH_FILE),
+            "--fuzz=0", "-i", str(PATCH_FILE),
         ],
         cwd=WLAN_DIR, capture_output=True, text=True,
     )
@@ -104,6 +104,17 @@ def _diagnose(path: Path, needle: str, context_lines: int = 15):
         print(f"    {i + 1:>6}\t{lines[i].replace(chr(9), '<TAB>')}")
 
 
+def already_present(path: Path, needle: str) -> bool:
+    """Idempotency check: some hunks succeed in the bulk patch step (possibly
+    landing correctly even when the hand-merge step's wider anchor doesn't
+    match due to surrounding tree-specific content). Check for the smallest
+    reliable signal before attempting a hand-merge, so already-applied work
+    isn't misreported as a failure."""
+    if not path.exists():
+        return False
+    return needle in path.read_text()
+
+
 def fuzzy_replace(path: Path, old_block: str, new_block: str, label: str,
                    required: bool = True, diagnose_needle: str = None):
     if not path.exists():
@@ -140,33 +151,119 @@ def fuzzy_replace(path: Path, old_block: str, new_block: str, label: str,
 def apply_hand_merges():
     print("\n== Step 2: hand-merged fixes for hunks that diverged from baseline ==")
 
-    # --- rx_monitor.h : add hdd_disable_monitor_mode decl + stub ---
-    f = HDD_INC.parent / "src" / "wlan_hdd_rx_monitor.h"
-    fuzzy_replace(f,
-        "int hdd_enable_monitor_mode(struct net_device *dev);\n#else",
-        "int hdd_enable_monitor_mode(struct net_device *dev);\n"
-        "int hdd_disable_monitor_mode(struct net_device *dev);\n#else",
-        "rx_monitor.h decl",
-        diagnose_needle="hdd_enable_monitor_mode(struct net_device *dev);")
-    fuzzy_replace(f,
-        "static inline int hdd_enable_monitor_mode(struct net_device *dev)\n"
-        "{\n\treturn 0;\n}\n#endif /* CONFIG_LITHIUM */",
-        "static inline int hdd_enable_monitor_mode(struct net_device *dev)\n"
-        "{\n\treturn 0;\n}\n"
-        "static inline int hdd_disable_monitor_mode(struct net_device *dev)\n"
-        "{\n\treturn 0;\n}\n#endif /* CONFIG_LITHIUM */",
-        "rx_monitor.h stub",
-        diagnose_needle="static inline int hdd_enable_monitor_mode")
+    # --- rx_monitor.h : hdd_disable_monitor_mode(void) already exists
+    #     natively in this tree (confirmed: declared at the prototype AND
+    #     stub, called from main.c with no args) -- it predates this patch
+    #     and is unrelated to it. The patch's own (struct net_device *dev)
+    #     version is dead code (grep of the full 44-file patch confirms
+    #     nothing calls it), so we do NOT add a conflicting declaration
+    #     here. See the wlan_hdd_rx_monitor.c fix below instead, which
+    #     removes the patch's duplicate definition and splices the one
+    #     line that matters (hdd_frame_inject_disable) into the real fn. ---
+    f = HDD_SRC / "wlan_hdd_rx_monitor.h"
+    if already_present(f, "hdd_disable_monitor_mode("):
+        print("[rx_monitor.h] hdd_disable_monitor_mode already present "
+              "(this tree's own, unrelated function) -- correctly left alone")
+    else:
+        msg = ("[rx_monitor.h] expected hdd_disable_monitor_mode to already "
+               "exist in this tree and it doesn't -- tree has changed more "
+               "than expected, needs a human to re-check")
+        FAILURES.append(msg)
 
-    # --- rx_monitor.c : conditional include ---
+    # --- rx_monitor.c : conditional include (often already landed via the
+    #     bulk patch step even when the hand-merge anchor below doesn't
+    #     match due to tree-specific surrounding content) ---
     f = HDD_SRC / "wlan_hdd_rx_monitor.c"
+    if already_present(f, '#include "wlan_hdd_frame_inject.h"'):
+        print("[rx_monitor.c include] already present -- skipping")
+    else:
+        fuzzy_replace(f,
+            '#include "wlan_hdd_rx_monitor.h"\n#include "ol_txrx.h"\n',
+            '#include "wlan_hdd_rx_monitor.h"\n#include "ol_txrx.h"\n'
+            '#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n'
+            '#include "wlan_hdd_frame_inject.h"\n#endif\n',
+            "rx_monitor.c include",
+            diagnose_needle='#include "wlan_hdd_rx_monitor.h"')
+
+    # --- rx_monitor.c : the patch adds its OWN hdd_disable_monitor_mode()
+    #     with a (struct net_device *dev) signature, which collides with
+    #     this tree's pre-existing (void)-signature function of the same
+    #     name -- confirmed via live grep as two full definitions in the
+    #     same file, which will not compile. Nothing in the 44-file patch
+    #     ever calls the (dev) version, so it's safe to delete outright;
+    #     splice its one useful line (hdd_frame_inject_disable) into the
+    #     real (void) function instead, using hdd_get_adapter(hdd_ctx,
+    #     QDF_MONITOR_MODE) to reach the monitor adapter without a dev
+    #     pointer in scope -- the same idiom this tree already uses
+    #     elsewhere (wlan_hdd_state_ctrl_param_write) to find it. ---
     fuzzy_replace(f,
-        '#include "wlan_hdd_rx_monitor.h"\n#include "ol_txrx.h"\n',
-        '#include "wlan_hdd_rx_monitor.h"\n#include "ol_txrx.h"\n'
-        '#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n'
-        '#include "wlan_hdd_frame_inject.h"\n#endif\n',
-        "rx_monitor.c include",
-        diagnose_needle='#include "wlan_hdd_rx_monitor.h"')
+        "/**\n"
+        " * hdd_disable_monitor_mode() - Disable monitor mode\n"
+        " * @dev: Pointer to the net_device structure\n"
+        " *\n"
+        " * This function disables monitor mode configuration on the hardware\n"
+        " * and also disables frame injection if it was enabled.\n"
+        " *\n"
+        " * Return: 0 for success; non-zero for failure\n"
+        " */\n"
+        "int hdd_disable_monitor_mode(struct net_device *dev)\n"
+        "{\n"
+        "\tvoid *soc = cds_get_context(QDF_MODULE_ID_SOC);\n"
+        "\tuint8_t vdev_id;\n"
+        "\tint ret;\n"
+        "#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n"
+        "\tstruct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(dev);\n"
+        "#endif\n"
+        "\n"
+        "\thdd_enter_dev(dev);\n"
+        "\n"
+        "\tvdev_id = cdp_get_mon_vdev_from_pdev(soc, OL_TXRX_PDEV_ID);\n"
+        "\tif (vdev_id < 0)\n"
+        "\t\treturn -EINVAL;\n"
+        "\n"
+        "#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n"
+        "\t/* Disable frame injection when monitor mode is disabled */\n"
+        "\tif (adapter) {\n"
+        "\t\tif (QDF_IS_STATUS_ERROR(hdd_frame_inject_disable(adapter))) {\n"
+        "\t\t\thdd_warn(\"Failed to disable frame injection\");\n"
+        "\t\t\t/* Continue with monitor mode disable */\n"
+        "\t\t}\n"
+        "\t}\n"
+        "#endif\n"
+        "\n"
+        "\tret = cdp_set_monitor_mode(soc, vdev_id, true);\n"
+        "\n"
+        "\treturn ret;\n"
+        "}\n"
+        "\n"
+        "int hdd_disable_monitor_mode(void)\n"
+        "{\n"
+        "\tvoid *soc = cds_get_context(QDF_MODULE_ID_SOC);\n"
+        "\n"
+        "\treturn cdp_reset_monitor_mode(soc, OL_TXRX_PDEV_ID, false);\n"
+        "}\n",
+        "int hdd_disable_monitor_mode(void)\n"
+        "{\n"
+        "\tvoid *soc = cds_get_context(QDF_MODULE_ID_SOC);\n"
+        "#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n"
+        "\tstruct hdd_context *hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);\n"
+        "\tstruct hdd_adapter *adapter;\n"
+        "\n"
+        "\tif (hdd_ctx) {\n"
+        "\t\tadapter = hdd_get_adapter(hdd_ctx, QDF_MONITOR_MODE);\n"
+        "\t\tif (adapter) {\n"
+        "\t\t\tif (QDF_IS_STATUS_ERROR(hdd_frame_inject_disable(adapter))) {\n"
+        "\t\t\t\thdd_warn(\"Failed to disable frame injection\");\n"
+        "\t\t\t\t/* Continue with monitor mode disable */\n"
+        "\t\t\t}\n"
+        "\t\t}\n"
+        "\t}\n"
+        "#endif\n"
+        "\n"
+        "\treturn cdp_reset_monitor_mode(soc, OL_TXRX_PDEV_ID, false);\n"
+        "}\n",
+        "rx_monitor.c remove duplicate hdd_disable_monitor_mode, splice into real fn",
+        diagnose_needle="int hdd_disable_monitor_mode(struct net_device *dev)")
 
     # --- cfg80211.c : conditional include + vendor cmd array entry ---
     f = HDD_SRC / "wlan_hdd_cfg80211.c"
@@ -187,17 +284,22 @@ def apply_hand_merges():
         "#endif\n",
         "cfg80211.c vendor cmd array")
 
-    # --- main.h : injection_ctx field ---
+    # --- main.h : injection_ctx field (often already landed via the bulk
+    #     patch step even when the hand-merge anchor below doesn't match
+    #     due to tree-specific fields between the two anchor lines) ---
     f = HDD_INC / "wlan_hdd_main.h"
-    fuzzy_replace(f,
-        "\tbool delete_in_progress;\n"
-        "\tqdf_atomic_t net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX];\n};",
-        "\tbool delete_in_progress;\n"
-        "\tqdf_atomic_t net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX];\n"
-        "\n#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n"
-        "\tstruct hdd_injection_ctx *injection_ctx;\n#endif\n};",
-        "main.h injection_ctx field",
-        diagnose_needle="net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX]")
+    if already_present(f, "struct hdd_injection_ctx *injection_ctx;"):
+        print("[main.h injection_ctx field] already present -- skipping")
+    else:
+        fuzzy_replace(f,
+            "\tbool delete_in_progress;\n"
+            "\tqdf_atomic_t net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX];\n};",
+            "\tbool delete_in_progress;\n"
+            "\tqdf_atomic_t net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX];\n"
+            "\n#ifdef FEATURE_FRAME_INJECTION_SUPPORT\n"
+            "\tstruct hdd_injection_ctx *injection_ctx;\n#endif\n};",
+            "main.h injection_ctx field",
+            diagnose_needle="net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX]")
 
     # --- main.c : __hdd_mon_open -- set carrier/queues up, keep existing
     #     BBM policy block this tree already has that the patch's baseline
