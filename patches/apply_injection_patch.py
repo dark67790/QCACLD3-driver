@@ -84,7 +84,7 @@ def _normalize_for_match(block: str) -> str:
     return escaped
 
 
-def _diagnose(path: Path, needle: str, context_lines: int = 15):
+def _diagnose(path: Path, needle: str, context_lines: int = 70):
     """On an anchor miss, locate a much smaller near-certain substring and
     dump real surrounding file content to the CI log, so we get ground
     truth from a single run instead of a manual back-and-forth."""
@@ -263,6 +263,41 @@ def get_patch_added_function_names():
     return result
 
 
+def _build_condition_paths(text: str):
+    """For every line, compute the stack of (block_id, branch) identifying
+    which #if/#ifdef nesting it's inside. Two lines are only genuinely
+    mutually-exclusive if they share a common block_id but differ in
+    branch at that id -- NOT just because some #else exists somewhere
+    between them in the file (which could belong to a totally unrelated
+    conditional for a different feature entirely, especially across a
+    1000+ line gap)."""
+    lines = text.split("\n")
+    stack = []  # list of [block_id, branch]
+    next_id = 0
+    paths = {}
+    for i, line in enumerate(lines, start=1):
+        s = line.strip()
+        if s.startswith(("#if", "#ifdef", "#ifndef")):
+            stack.append([next_id, 0])
+            next_id += 1
+        elif s.startswith(("#elif", "#else")):
+            if stack:
+                stack[-1][1] += 1
+        elif s.startswith("#endif"):
+            if stack:
+                stack.pop()
+        paths[i] = tuple((bid, br) for bid, br in stack)
+    return paths
+
+
+def _mutually_exclusive(path_a, path_b):
+    a_map, b_map = dict(path_a), dict(path_b)
+    shared = set(a_map) & set(b_map)
+    if not shared:
+        return False  # no common conditional at all -- not exclusive
+    return any(a_map[bid] != b_map[bid] for bid in shared)
+
+
 def scan_for_duplicate_functions():
     """For the narrow, patch-derived list of function names (see
     get_patch_added_function_names), check whether the FINAL merged file
@@ -286,6 +321,7 @@ def scan_for_duplicate_functions():
             print(f"  (skip, file not found: {rel})")
             continue
         text = target.read_text()
+        paths = _build_condition_paths(text)
         for name in sorted(names):
             # (?!\s*[*/]) excludes comment lines -- kernel doc convention
             # writes "* funcname() - description" which would otherwise
@@ -301,12 +337,12 @@ def scan_for_duplicate_functions():
                 print(f"  ok  {name}  ({rel}) -- {len(match_lines)} occurrence(s)")
                 continue
             # 2+ occurrences -- legitimate only if every consecutive pair
-            # has a #else/#elif between them (mutually exclusive branches)
+            # is genuinely under mutually-exclusive branches of the SAME
+            # conditional (shared block_id, different branch), not just
+            # separated by an unrelated #else somewhere else in the file.
             branch_separated = True
             for a, b in zip(match_lines, match_lines[1:]):
-                between = text.split("\n")[a:b - 1]
-                if not any(l.strip().startswith(("#else", "#elif"))
-                            for l in between):
+                if not _mutually_exclusive(paths.get(a, ()), paths.get(b, ())):
                     branch_separated = False
                     break
             if branch_separated:
