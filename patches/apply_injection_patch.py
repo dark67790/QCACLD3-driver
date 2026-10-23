@@ -43,17 +43,7 @@ HDD_SRC = QCACLD / "core/hdd/src"
 HDD_INC = QCACLD / "core/hdd/inc"
 WMA_SRC = QCACLD / "core/wma/src"
 CONFIGS = QCACLD / "configs"
-
 PATCH_FILE = Path(__file__).resolve().parent / "07_packet_injection.patch"
-if not PATCH_FILE.exists():
-    for candidate in [
-        Path(__file__).resolve().parent / "patches" / "07_packet_injection.patch",
-        REPO_ROOT / "patches" / "07_packet_injection.patch",
-        REPO_ROOT / "07_packet_injection.patch",
-    ]:
-        if candidate.exists():
-            PATCH_FILE = candidate
-            break
 
 FAILURES = []
 ATTEMPTED_FILES = set()  # files this script has any hand-merge logic for at all
@@ -88,7 +78,8 @@ def _normalize_for_match(block: str) -> str:
     Newlines are preserved as literal newlines (not relaxed), since we DO
     want to catch genuine structural differences in line breaks."""
     escaped = re.escape(block)
-    # collapse any run of escaped horizontal whitespace into [ \t]+
+    # re.escape turns each space/tab into a literal char; collapse any run
+    # of escaped horizontal whitespace into a flexible \s+ (but not \n).
     escaped = re.sub(r"(?:\\ |\\\t)+", r"[ \\t]+", escaped)
     return escaped
 
@@ -110,12 +101,16 @@ def _diagnose(path: Path, needle: str, context_lines: int = 70):
     print(f"    DIAGNOSE: needle found at line {line_no}, real content "
           f"(lines {start + 1}-{end}):")
     for i in range(start, end):
+        # render tabs visibly so indentation-only drift is obvious in the log
         print(f"    {i + 1:>6}\t{lines[i].replace(chr(9), '<TAB>')}")
 
 
 def already_present(path: Path, needle: str) -> bool:
-    """Idempotency check: some hunks succeed in the bulk patch step. Check
-    for the smallest reliable signal before attempting a hand-merge."""
+    """Idempotency check: some hunks succeed in the bulk patch step (possibly
+    landing correctly even when the hand-merge step's wider anchor doesn't
+    match due to surrounding tree-specific content). Check for the smallest
+    reliable signal before attempting a hand-merge, so already-applied work
+    isn't misreported as a failure."""
     ATTEMPTED_FILES.add(path.resolve())
     if not path.exists():
         return False
@@ -156,113 +151,19 @@ def fuzzy_replace(path: Path, old_block: str, new_block: str, label: str,
     return True
 
 
-def remove_c_function(path: Path, marker: str, sig_pattern: str, label: str) -> bool:
-    """Safely removes an entire C function and its preceding docstring by
-    matching an unambiguous marker in its doc comment and tracking C brace
-    depth ({ ... }). This avoids brittle literal matching of large function
-    bodies that can fail over comments, whitespace, or macro variations."""
-    ATTEMPTED_FILES.add(path.resolve())
-    if not path.exists():
-        msg = f"[{label}] file not found: {path}"
-        FAILURES.append(msg)
-        return False
-
-    text = path.read_text()
-    marker_pos = text.find(marker)
-    if marker_pos == -1:
-        msg = f"[{label}] marker {marker!r} not found in {path}"
-        FAILURES.append(msg)
-        return False
-
-    # Find the docstring start (/**) before the marker
-    doc_start = text.rfind("/**", 0, marker_pos)
-    sig_match = re.search(sig_pattern, text[marker_pos:])
-    if not sig_match:
-        msg = f"[{label}] signature pattern {sig_pattern!r} not found after marker in {path}"
-        FAILURES.append(msg)
-        _diagnose(path, marker)
-        return False
-
-    sig_start = marker_pos + sig_match.start()
-    func_start = doc_start if doc_start != -1 else sig_start
-
-    # Locate the opening brace of the function body
-    brace_open = text.find("{", marker_pos + sig_match.end())
-    if brace_open == -1:
-        msg = f"[{label}] opening brace not found for function in {path}"
-        FAILURES.append(msg)
-        _diagnose(path, marker)
-        return False
-
-    depth = 0
-    in_line_comment = False
-    in_block_comment = False
-    in_string = False
-    func_end = -1
-
-    i = brace_open
-    while i < len(text):
-        c = text[i]
-        next_c = text[i + 1] if i + 1 < len(text) else ""
-
-        if in_line_comment:
-            if c == "\n":
-                in_line_comment = False
-        elif in_block_comment:
-            if c == "*" and next_c == "/":
-                in_block_comment = False
-                i += 1
-        elif in_string:
-            if c == "\\":
-                i += 1  # skip escape
-            elif c == '"':
-                in_string = False
-        else:
-            if c == "/" and next_c == "/":
-                in_line_comment = True
-                i += 1
-            elif c == "/" and next_c == "*":
-                in_block_comment = True
-                i += 1
-            elif c == '"':
-                in_string = True
-            elif c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    func_end = i + 1
-                    # consume trailing whitespace/newlines
-                    while func_end < len(text) and text[func_end] in " \t\r":
-                        func_end += 1
-                    if func_end < len(text) and text[func_end] == "\n":
-                        func_end += 1
-                    if func_end < len(text) and text[func_end] == "\n":
-                        func_end += 1
-                    break
-        i += 1
-
-    if func_end == -1 or depth != 0:
-        msg = f"[{label}] failed to find matching closing brace in {path}"
-        FAILURES.append(msg)
-        _diagnose(path, marker)
-        return False
-
-    new_text = text[:func_start] + text[func_end:]
-    path.write_text(new_text)
-    print(f"[{label}] removed duplicate function -> {path.relative_to(REPO_ROOT)}")
-    return True
-
-
 def dump_rejects():
-    """Dump full ground-truth context for remaining .rej files."""
+    """Dump full ground-truth context for every remaining .rej file in one
+    pass: the literal expected hunk plus the real file's actual content at
+    that location. Runs after Step 1 so any NEW divergence (files we have
+    no hand-merge fix for yet) surfaces in this run's log instead of
+    requiring another manual round-trip."""
     rejects = sorted(WLAN_DIR.rglob("*.rej"))
     if not rejects:
         print("\n(no .rej files after bulk patch step -- nothing to diagnose)")
         return
     print(f"\n{'=' * 60}\nDIAGNOSING {len(rejects)} REMAINING .rej FILE(S)\n{'=' * 60}")
     for rej in rejects:
-        target = rej.with_suffix("")
+        target = rej.with_suffix("")  # strip trailing .rej
         print(f"\n--- {rej.relative_to(WLAN_DIR)} ---")
         rej_text = rej.read_text()
         print("EXPECTED (literal hunk from patch):")
@@ -290,6 +191,11 @@ KEYWORD_BLACKLIST = {
 
 
 def _extract_defs_from_added_lines(added_text: str):
+    """Given just the '+' lines of ONE hunk (already de-prefixed, in
+    order), find function definitions within that added block only.
+    Scoped to a single hunk's additions -- never the full file -- so
+    pre-existing #ifdef/#else branch-pairs elsewhere in the file never
+    enter into this at all."""
     lines = added_text.split("\n")
     names = []
     i, n = 0, len(lines)
@@ -327,6 +233,14 @@ def _extract_defs_from_added_lines(added_text: str):
 
 
 def get_patch_added_function_names():
+    """Parse the patch itself (not any target tree) to find the narrow,
+    specific list of function names it newly defines in EXISTING files
+    (files without 'new file mode' -- brand new files can't collide with
+    anything). Scoped to each hunk's own '+' lines only, which is what
+    keeps this accurate: we're asking 'what does the patch add', not
+    'find every function anywhere', so the vast pre-existing codebase
+    (full of legitimate #ifdef/#else same-name branch-pairs) never enters
+    into the analysis. Returns {relative_path: set(names)}."""
     patch_text = PATCH_FILE.read_text()
     parts = re.split(r"^diff --git a/(\S+) b/\S+$", patch_text, flags=re.M)
     pairs = list(zip(parts[1::2], parts[2::2]))
@@ -335,7 +249,7 @@ def get_patch_added_function_names():
         if not path.endswith(".c"):
             continue
         if "new file mode" in content[:500]:
-            continue
+            continue  # brand new file -- nothing pre-existing to collide with
         names = set()
         for hunk in re.split(r"^@@.*@@.*$", content, flags=re.M)[1:]:
             added = "\n".join(
@@ -350,8 +264,15 @@ def get_patch_added_function_names():
 
 
 def _build_condition_paths(text: str):
+    """For every line, compute the stack of (block_id, branch) identifying
+    which #if/#ifdef nesting it's inside. Two lines are only genuinely
+    mutually-exclusive if they share a common block_id but differ in
+    branch at that id -- NOT just because some #else exists somewhere
+    between them in the file (which could belong to a totally unrelated
+    conditional for a different feature entirely, especially across a
+    1000+ line gap)."""
     lines = text.split("\n")
-    stack = []
+    stack = []  # list of [block_id, branch]
     next_id = 0
     paths = {}
     for i, line in enumerate(lines, start=1):
@@ -373,11 +294,34 @@ def _mutually_exclusive(path_a, path_b):
     a_map, b_map = dict(path_a), dict(path_b)
     shared = set(a_map) & set(b_map)
     if not shared:
-        return False
+        return False  # no common conditional at all -- not exclusive
     return any(a_map[bid] != b_map[bid] for bid in shared)
 
 
+def _diagnose_duplicate(path: Path, name: str, lines_list, context_lines: int = 24):
+    """Dump real context around each occurrence of a duplicated function name,
+    the same way _diagnose() does for a missed .rej anchor, so a genuine new
+    divergence (one this script has no hand-merge logic for yet) gets ground
+    truth in this run's log instead of requiring a guessed fix."""
+    lines = path.read_text().splitlines()
+    for ln in lines_list:
+        lo = max(0, ln - 1 - context_lines // 2)
+        hi = min(len(lines), ln - 1 + context_lines // 2)
+        print(f"    DIAGNOSE DUPLICATE '{name}' at line {ln} in {path.name} "
+              f"(showing {lo + 1}-{hi}):")
+        for i in range(lo, hi):
+            print(f"    {i + 1:>6}\t{lines[i].replace(chr(9), '<TAB>')}")
+
+
 def scan_for_duplicate_functions():
+    """For the narrow, patch-derived list of function names (see
+    get_patch_added_function_names), check whether the FINAL merged file
+    defines each name more than once -- and if so, whether the two
+    definitions sit in mutually-exclusive #ifdef/#else branches (legal,
+    normal kernel style, not a bug) versus truly both being live (the
+    bug class behind hdd_disable_monitor_mode and
+    wlan_hdd_cfg80211_get_channel). Runs after hand-merges so it reflects
+    final state."""
     print(f"\n{'=' * 60}\nSCANNING FOR DUPLICATE FUNCTION DEFINITIONS\n{'=' * 60}")
     name_map = get_patch_added_function_names()
     total_names = sum(len(v) for v in name_map.values())
@@ -394,6 +338,11 @@ def scan_for_duplicate_functions():
         text = target.read_text()
         paths = _build_condition_paths(text)
         for name in sorted(names):
+            # (?!\s*[*/]) excludes comment lines -- kernel doc convention
+            # writes "* funcname() - description" which would otherwise
+            # false-match. [\w \t\*]  (not \s) keeps the flexible middle
+            # portion from crossing newlines, since \s matches '\n' too
+            # and would otherwise let this bridge into unrelated lines.
             pattern = re.compile(
                 r"^(?!\s*[*/])(?:static[ \t]+)?(?:inline[ \t]+)?"
                 r"[\w \t\*]*?\b" + re.escape(name) + r"[ \t]*\(", re.M)
@@ -402,6 +351,10 @@ def scan_for_duplicate_functions():
             if len(match_lines) <= 1:
                 print(f"  ok  {name}  ({rel}) -- {len(match_lines)} occurrence(s)")
                 continue
+            # 2+ occurrences -- legitimate only if every consecutive pair
+            # is genuinely under mutually-exclusive branches of the SAME
+            # conditional (shared block_id, different branch), not just
+            # separated by an unrelated #else somewhere else in the file.
             branch_separated = True
             for a, b in zip(match_lines, match_lines[1:]):
                 if not _mutually_exclusive(paths.get(a, ()), paths.get(b, ())):
@@ -418,6 +371,7 @@ def scan_for_duplicate_functions():
                        f"likely a real compile-breaking duplicate")
                 FAILURES.append(msg)
                 print(f"  !! {msg}")
+                _diagnose_duplicate(target, name, match_lines)
     if not any_found:
         print("\n  No unresolved duplicates found.")
 
@@ -425,7 +379,15 @@ def scan_for_duplicate_functions():
 def apply_hand_merges():
     print("\n== Step 2: hand-merged fixes for hunks that diverged from baseline ==")
 
-    # --- rx_monitor.h : native hdd_disable_monitor_mode(void) exists ---
+    # --- rx_monitor.h : hdd_disable_monitor_mode(void) already exists
+    #     natively in this tree (confirmed: declared at the prototype AND
+    #     stub, called from main.c with no args) -- it predates this patch
+    #     and is unrelated to it. The patch's own (struct net_device *dev)
+    #     version is dead code (grep of the full 44-file patch confirms
+    #     nothing calls it), so we do NOT add a conflicting declaration
+    #     here. See the wlan_hdd_rx_monitor.c fix below instead, which
+    #     removes the patch's duplicate definition and splices the one
+    #     line that matters (hdd_frame_inject_disable) into the real fn. ---
     f = HDD_SRC / "wlan_hdd_rx_monitor.h"
     if already_present(f, "hdd_disable_monitor_mode("):
         print("[rx_monitor.h] hdd_disable_monitor_mode already present "
@@ -436,7 +398,9 @@ def apply_hand_merges():
                "than expected, needs a human to re-check")
         FAILURES.append(msg)
 
-    # --- rx_monitor.c : conditional include ---
+    # --- rx_monitor.c : conditional include (often already landed via the
+    #     bulk patch step even when the hand-merge anchor below doesn't
+    #     match due to tree-specific surrounding content) ---
     f = HDD_SRC / "wlan_hdd_rx_monitor.c"
     if already_present(f, '#include "wlan_hdd_frame_inject.h"'):
         print("[rx_monitor.c include] already present -- skipping")
@@ -449,7 +413,22 @@ def apply_hand_merges():
             "rx_monitor.c include",
             diagnose_needle='#include "wlan_hdd_rx_monitor.h"')
 
-    # --- rx_monitor.c : splice frame inject disable into void function ---
+    # --- rx_monitor.c : the patch adds its OWN hdd_disable_monitor_mode()
+    #     with a (struct net_device *dev) signature, which collides with
+    #     this tree's pre-existing (void)-signature function of the same
+    #     name -- confirmed via live grep as two full definitions in the
+    #     same file, which will not compile. Nothing in the 44-file patch
+    #     ever calls the (dev) version, so it's safe to delete outright;
+    #     splice its one useful line (hdd_frame_inject_disable) into the
+    #     real (void) function instead, using hdd_get_adapter(hdd_ctx,
+    #     QDF_MONITOR_MODE) to reach the monitor adapter without a dev
+    #     pointer in scope -- the same idiom this tree already uses
+    #     elsewhere (wlan_hdd_state_ctrl_param_write) to find it. ---
+    # The patch's own duplicate (struct net_device *dev) version may or may
+    # not have landed depending on fuzz tolerance in Step 1 -- handle both
+    # outcomes instead of assuming one. Either way the end state should be:
+    # exactly one hdd_disable_monitor_mode(void), with frame-inject-disable
+    # spliced in via hdd_get_adapter(hdd_ctx, QDF_MONITOR_MODE).
     splice_marker = "hdd_get_adapter(hdd_ctx, QDF_MONITOR_MODE)"
     dup_marker = "int hdd_disable_monitor_mode(struct net_device *dev)"
     void_fn = (
@@ -486,6 +465,9 @@ def apply_hand_merges():
     if already_present(f, splice_marker):
         print("[rx_monitor.c disable-mode splice] already present -- skipping")
     elif already_present(f, dup_marker):
+        # fuzzy match let the patch's conflicting duplicate land -- remove
+        # it entirely (confirmed unused anywhere in the 44-file patch) and
+        # splice into the real function in one combined edit.
         dup_fn = (
             "/**\n"
             " * hdd_disable_monitor_mode() - Disable monitor mode\n"
@@ -531,6 +513,8 @@ def apply_hand_merges():
                       "rx_monitor.c remove duplicate, splice into real fn",
                       diagnose_needle=dup_marker)
     else:
+        # Common case under tighter fuzz: the duplicate never landed, the
+        # tree's original single function is untouched -- extend it directly.
         fuzzy_replace(f, void_fn, spliced_void_fn,
                       "rx_monitor.c splice into existing fn (no duplicate present)",
                       diagnose_needle="int hdd_disable_monitor_mode(void)")
@@ -554,11 +538,16 @@ def apply_hand_merges():
         "#endif\n",
         "cfg80211.c vendor cmd array")
 
-    # --- main.h : injection_ctx field ---
+    # --- main.h : injection_ctx field (often already landed via the bulk
+    #     patch step even when the hand-merge anchor below doesn't match
+    #     due to tree-specific fields between the two anchor lines) ---
     f = HDD_INC / "wlan_hdd_main.h"
     if already_present(f, "struct hdd_injection_ctx *injection_ctx;"):
         print("[main.h injection_ctx field] already present -- skipping")
     else:
+        # Confirmed stable across two independent runs: this single line is
+        # a reliable anchor regardless of what surrounds it (field order /
+        # #ifdef blocks around it drift between runs/snapshots, this doesn't).
         fuzzy_replace(f,
             "\tqdf_atomic_t net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX];\n",
             "\tqdf_atomic_t net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX];\n"
@@ -567,7 +556,9 @@ def apply_hand_merges():
             "main.h injection_ctx field",
             diagnose_needle="net_dev_hold_ref_count[NET_DEV_HOLD_ID_MAX]")
 
-    # --- main.c : __hdd_mon_open ---
+    # --- main.c : __hdd_mon_open -- set carrier/queues up, keep existing
+    #     BBM policy block this tree already has that the patch's baseline
+    #     didn't ---
     f = HDD_SRC / "wlan_hdd_main.c"
     fuzzy_replace(f,
         "\tret = hdd_set_mon_rx_cb(dev);\n\n"
@@ -602,7 +593,8 @@ def apply_hand_merges():
         "\treturn 0;\n}",
         "main.c __hdd_mon_open")
 
-    # --- wma_main.c : wma_open ---
+    # --- wma_main.c : wma_open -- inject queue init, after this tree's
+    #     extra wma_trace_init() call ---
     f = WMA_SRC / "wma_main.c"
     fuzzy_replace(f,
         "\twma_register_mws_coex_events(wma_handle);\n"
@@ -618,7 +610,7 @@ def apply_hand_merges():
         "\t}\n\n\treturn QDF_STATUS_SUCCESS;",
         "wma_main.c wma_open injection queue init")
 
-    # --- wma_utils.c : wma_mon_mlme_vdev_down_send ---
+    # --- wma_utils.c : wma_mon_mlme_vdev_down_send -- del_bss_resp alloc ---
     f = WMA_SRC / "wma_utils.c"
     fuzzy_replace(f,
         "\twlan_vdev_mlme_sm_deliver_evt(vdev_mlme->vdev,\n"
@@ -636,7 +628,11 @@ def apply_hand_merges():
         "\t}\n\n\treturn status;",
         "wma_utils.c del_bss_resp alloc")
 
-    # --- Kbuild : object files and flags ---
+    # --- Kbuild : wire the new object files + cppflag into the build.
+    #     Three separate insertion points, confirmed against real file
+    #     content (patch's own hunks reported "Reversed or previously
+    #     applied" against this tree, so its context can't be trusted --
+    #     these three anchors were pulled directly from the real file). ---
     f = QCACLD / "Kbuild"
     if already_present(f, "CONFIG_FEATURE_FRAME_INJECTION_SUPPORT), y)"):
         print("[Kbuild] already present -- skipping")
@@ -686,25 +682,102 @@ def apply_hand_merges():
             "Kbuild cppflags",
             diagnose_needle="cppflags-y += -DDISABLE_MON_CONFIG")
 
-    # --- cfg80211.c : duplicate get_channel dedup ---
-    # The patch adds a simplified wlan_hdd_cfg80211_get_channel() which
-    # collides with this tree's native SSR-safe function. We remove the
-    # duplicate cleanly using remove_c_function, which avoids brittle
-    # transcriptions of internal comments (/* Primary source: ... */, etc.).
+    # --- cfg80211.c : the patch adds its own simplified
+    #     wlan_hdd_cfg80211_get_channel(), which collides with this tree's
+    #     own, more complete SSR-safe wrapper (__wlan_hdd_cfg80211_get_channel
+    #     + osif_vdev_sync_op_start/stop pattern) of the same name. Confirmed
+    #     via a live compile error (redefinition). Identify the patch's
+    #     version by its distinctive docstring text (unique to this patch,
+    #     not generic CAF prose) rather than line numbers, since those drift.
+    #     .get_channel isn't on frame-injection's critical path (pure
+    #     userspace channel introspection), so deleting it outright is safe
+    #     -- no need to port its mon_chan_freq fallback into the real fn.
+    #
+    #     NOTE: ground-truth dump (DIAGNOSE) showed this tree's copy of the
+    #     function has two extra kernel-doc-style inline comments ("Primary
+    #     source: ..." / "Fallback: ...") between the `if (!adapter)` guard
+    #     and the switch block, that the original transcription of this
+    #     anchor omitted. Anchor below now matches lines 22803-22845 of
+    #     wlan_hdd_cfg80211.c verbatim, tabs included. ---
     f = HDD_SRC / "wlan_hdd_cfg80211.c"
     patch_get_channel_marker = "so that tools like aireplay-ng / mdk3 can determine the current channel."
     if not already_present(f, patch_get_channel_marker):
         print("[cfg80211.c get_channel dedup] patch's duplicate not present -- skipping")
     else:
-        remove_c_function(
-            f,
-            patch_get_channel_marker,
-            r"static\s+int\s+wlan_hdd_cfg80211_get_channel\b",
-            "cfg80211.c remove duplicate get_channel"
-        )
+        fuzzy_replace(f,
+            "/**\n"
+            " * wlan_hdd_cfg80211_get_channel() - Report current operating channel\n"
+            " * @wiphy: wiphy handle\n"
+            " * @wdev: wireless_dev handle\n"
+            " * @chandef: output channel definition\n"
+            " *\n"
+            " * Required by nl80211 (NL80211_CMD_GET_INTERFACE) and wext (SIOCGIWFREQ)\n"
+            " * so that tools like aireplay-ng / mdk3 can determine the current channel.\n"
+            " *\n"
+            " * Return: 0 on success, -ENODATA if no channel is set.\n"
+            " */\n"
+            "static int wlan_hdd_cfg80211_get_channel(struct wiphy *wiphy,\n"
+            "\t\t\t\t\t struct wireless_dev *wdev,\n"
+            "\t\t\t\t\t struct cfg80211_chan_def *chandef)\n"
+            "{\n"
+            "\tstruct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(wdev->netdev);\n"
+            "\tstruct hdd_station_ctx *sta_ctx;\n"
+            "\tstruct hdd_mon_set_ch_info *ch_info;\n"
+            "\tstruct ieee80211_channel *chan;\n"
+            "\tuint32_t freq;\n"
+            "\n"
+            "\tif (!adapter)\n"
+            "\t\treturn -ENODATA;\n"
+            "\n"
+            "\t/* Primary source: adapter->mon_chan_freq (set by both boot-time\n"
+            "\t * monitor mode and cfg80211 set_monitor_channel).\n"
+            "\t */\n"
+            "\tfreq = adapter->mon_chan_freq;\n"
+            "\n"
+            "\t/* Fallback: station context ch_info (set by hdd_mon_select_cbmode\n"
+            "\t * in the roam callback path).\n"
+            "\t */\n"
+            "\tif (!freq) {\n"
+            "\t\tsta_ctx = WLAN_HDD_GET_STATION_CTX_PTR(adapter);\n"
+            "\t\tch_info = &sta_ctx->ch_info;\n"
+            "\t\tfreq = ch_info->freq;\n"
+            "\t}\n"
+            "\n"
+            "\tif (!freq)\n"
+            "\t\treturn -ENODATA;\n"
+            "\n"
+            "\tchan = ieee80211_get_channel(wiphy, freq);\n"
+            "\tif (!chan)\n"
+            "\t\treturn -ENODATA;\n"
+            "\n"
+            "\tcfg80211_chandef_create(chandef, chan, NL80211_CHAN_NO_HT);\n"
+            "\n"
+            "\tswitch (adapter->mon_bandwidth) {\n"
+            "\tcase CH_WIDTH_40MHZ:\n"
+            "\t\tchandef->width = NL80211_CHAN_WIDTH_40;\n"
+            "\t\tbreak;\n"
+            "\tcase CH_WIDTH_80MHZ:\n"
+            "\t\tchandef->width = NL80211_CHAN_WIDTH_80;\n"
+            "\t\tbreak;\n"
+            "\tcase CH_WIDTH_160MHZ:\n"
+            "\t\tchandef->width = NL80211_CHAN_WIDTH_160;\n"
+            "\t\tbreak;\n"
+            "\tdefault:\n"
+            "\t\tbreak;\n"
+            "\t}\n"
+            "\n"
+            "\treturn 0;\n"
+            "}\n"
+            "\n",
+            "",
+            "cfg80211.c remove duplicate get_channel",
+            diagnose_needle=patch_get_channel_marker)
 
-        # Drop one of the two identical .get_channel initializers in
-        # wlan_hdd_cfg80211_ops (keep the unconditional one).
+        # Drop one of the two identical .get_channel = ... designated
+        # initializers in wlan_hdd_cfg80211_ops (disambiguate via the
+        # unique neighboring .set_monitor_channel line; keep the
+        # unconditional one near .get_antenna so get_channel always works,
+        # not only when FEATURE_MONITOR_MODE_SUPPORT is on).
         fuzzy_replace(f,
             "#ifdef FEATURE_MONITOR_MODE_SUPPORT\n"
             "\t.set_monitor_channel = wlan_hdd_cfg80211_set_mon_ch,\n"
@@ -724,7 +797,9 @@ def apply_hand_merges():
         "CONFIG_FEATURE_FRAME_INJECTION_SUPPORT := y\n",
         "default_defconfig injection flag")
 
-    # --- tx_rx.c : wlan_hdd_netif_queue_control monitor guard ---
+    # --- tx_rx.c : wlan_hdd_netif_queue_control -- monitor-interface
+    #     carrier/queue debug guard, after this tree's extra MLO
+    #     hdd_adapter_is_link_adapter() guard ---
     f = HDD_SRC / "wlan_hdd_tx_rx.c"
     fuzzy_replace(f,
         "\tuint32_t temp_map;\n\tuint8_t index;\n"
@@ -754,6 +829,9 @@ def apply_hand_merges():
 
 
 def check_unaddressed_rejects():
+    """Flag any .rej whose target file has NO hand-merge logic at all in
+    this script, so an unknown divergence doesn't get silently wiped by
+    cleanup() and mistaken for a clean run."""
     for rej in sorted(WLAN_DIR.rglob("*.rej")):
         target = rej.with_suffix("").resolve()
         if target not in ATTEMPTED_FILES:
