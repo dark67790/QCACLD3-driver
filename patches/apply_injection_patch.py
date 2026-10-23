@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 apply_injection_patch.py
@@ -190,83 +191,133 @@ KEYWORD_BLACKLIST = {
 }
 
 
-def find_function_definitions(text: str):
-    """Heuristic scan for column-0 (non-indented) C function definitions,
-    tolerating multi-line parameter lists. Not a real parser -- intended to
-    catch the specific bug class we've hit twice now (the patch defining a
-    function that collides with one this tree already has), not to be a
-    general-purpose static analyzer."""
-    lines = text.split("\n")
-    defs = []
+def _extract_defs_from_added_lines(added_text: str):
+    """Given just the '+' lines of ONE hunk (already de-prefixed, in
+    order), find function definitions within that added block only.
+    Scoped to a single hunk's additions -- never the full file -- so
+    pre-existing #ifdef/#else branch-pairs elsewhere in the file never
+    enter into this at all."""
+    lines = added_text.split("\n")
+    names = []
     i, n = 0, len(lines)
     while i < n:
         line = lines[i]
         if line and line[0] not in (" ", "\t", "#", "/", "*", "}", "{", ";"):
-            sig_lines = [line]
+            sig = [line]
             j = i
             found_close = line.rstrip().endswith(")")
-            has_semicolon = ";" in line
-            while not found_close and not has_semicolon and j + 1 < n and j - i < 10:
+            has_semi = ";" in line
+            while not found_close and not has_semi and j + 1 < n and j - i < 10:
                 j += 1
-                sig_lines.append(lines[j])
+                sig.append(lines[j])
                 if ";" in lines[j]:
-                    has_semicolon = True
+                    has_semi = True
                     break
                 if lines[j].rstrip().endswith(")"):
                     found_close = True
                     break
-            if found_close and not has_semicolon:
+            if found_close and not has_semi:
                 k = j + 1
                 while k < n and lines[k].strip() == "":
                     k += 1
                 if k < n and lines[k].strip() == "{":
-                    sig_text = " ".join(s.strip() for s in sig_lines)
+                    sig_text = " ".join(s.strip() for s in sig)
                     m = re.match(
                         r"^(?:static\s+)?(?:inline\s+)?(?:const\s+)?"
                         r"[A-Za-z_][\w\s\*]*?\b([A-Za-z_]\w*)\s*\(",
                         sig_text)
                     if m and m.group(1) not in KEYWORD_BLACKLIST:
-                        defs.append((m.group(1), i + 1))
+                        names.append(m.group(1))
                     i = k
         i += 1
-    return defs
+    return names
+
+
+def get_patch_added_function_names():
+    """Parse the patch itself (not any target tree) to find the narrow,
+    specific list of function names it newly defines in EXISTING files
+    (files without 'new file mode' -- brand new files can't collide with
+    anything). Scoped to each hunk's own '+' lines only, which is what
+    keeps this accurate: we're asking 'what does the patch add', not
+    'find every function anywhere', so the vast pre-existing codebase
+    (full of legitimate #ifdef/#else same-name branch-pairs) never enters
+    into the analysis. Returns {relative_path: set(names)}."""
+    patch_text = PATCH_FILE.read_text()
+    parts = re.split(r"^diff --git a/(\S+) b/\S+$", patch_text, flags=re.M)
+    pairs = list(zip(parts[1::2], parts[2::2]))
+    result = {}
+    for path, content in pairs:
+        if not path.endswith(".c"):
+            continue
+        if "new file mode" in content[:500]:
+            continue  # brand new file -- nothing pre-existing to collide with
+        names = set()
+        for hunk in re.split(r"^@@.*@@.*$", content, flags=re.M)[1:]:
+            added = "\n".join(
+                l[1:] for l in hunk.split("\n")
+                if l.startswith("+") and not l.startswith("+++")
+            )
+            names.update(_extract_defs_from_added_lines(added))
+        if names:
+            rel = re.sub(r"^drivers/staging/", "", path)
+            result[rel] = names
+    return result
 
 
 def scan_for_duplicate_functions():
-    """Scan every .c file this patch touches for duplicate top-level
-    function definitions -- the exact bug class behind both the
-    hdd_disable_monitor_mode and wlan_hdd_cfg80211_get_channel failures.
-    Runs after hand-merges so it reflects the final patched state, and
-    reports everything in one pass instead of one `make` failure at a time."""
+    """For the narrow, patch-derived list of function names (see
+    get_patch_added_function_names), check whether the FINAL merged file
+    defines each name more than once -- and if so, whether the two
+    definitions sit in mutually-exclusive #ifdef/#else branches (legal,
+    normal kernel style, not a bug) versus truly both being live (the
+    bug class behind hdd_disable_monitor_mode and
+    wlan_hdd_cfg80211_get_channel). Runs after hand-merges so it reflects
+    final state."""
     print(f"\n{'=' * 60}\nSCANNING FOR DUPLICATE FUNCTION DEFINITIONS\n{'=' * 60}")
-    touched = sorted(set(
-        m.group(1) for m in re.finditer(
-            r"^diff --git a/drivers/staging/(\S+\.c) ",
-            PATCH_FILE.read_text(), re.M)
-    ))
+    name_map = get_patch_added_function_names()
+    total_names = sum(len(v) for v in name_map.values())
+    print(f"Patch defines {total_names} new function name(s) across "
+          f"{len(name_map)} existing file(s) -- checking each for "
+          f"unintended duplication in the final tree:")
+
     any_found = False
-    for rel in touched:
-        c_file = WLAN_DIR / rel
-        if not c_file.exists():
+    for rel, names in sorted(name_map.items()):
+        target = WLAN_DIR / rel
+        if not target.exists():
+            print(f"  (skip, file not found: {rel})")
             continue
-        try:
-            text = c_file.read_text()
-        except Exception as e:
-            print(f"  (couldn't read {rel}: {e})")
-            continue
-        defs = find_function_definitions(text)
-        seen = {}
-        for name, line_no in defs:
-            seen.setdefault(name, []).append(line_no)
-        for name, lines_list in sorted(seen.items()):
-            if len(lines_list) > 1:
+        text = target.read_text()
+        for name in sorted(names):
+            pattern = re.compile(
+                r"^(?:static\s+)?(?:inline\s+)?[\w\s\*]*?\b" +
+                re.escape(name) + r"\s*\(", re.M)
+            match_lines = [text.count("\n", 0, m.start()) + 1
+                           for m in pattern.finditer(text)]
+            if len(match_lines) <= 1:
+                print(f"  ok  {name}  ({rel}) -- {len(match_lines)} occurrence(s)")
+                continue
+            # 2+ occurrences -- legitimate only if every consecutive pair
+            # has a #else/#elif between them (mutually exclusive branches)
+            branch_separated = True
+            for a, b in zip(match_lines, match_lines[1:]):
+                between = text.split("\n")[a:b - 1]
+                if not any(l.strip().startswith(("#else", "#elif"))
+                            for l in between):
+                    branch_separated = False
+                    break
+            if branch_separated:
+                print(f"  ok  {name}  ({rel}) -- {len(match_lines)}x at "
+                      f"{match_lines}, each in its own #ifdef/#else branch")
+            else:
                 any_found = True
                 msg = (f"[duplicate-definition] '{name}' defined "
-                       f"{len(lines_list)}x in {rel} at lines {lines_list}")
+                       f"{len(match_lines)}x in {rel} at lines "
+                       f"{match_lines}, NOT separated by #else/#elif -- "
+                       f"likely a real compile-breaking duplicate")
                 FAILURES.append(msg)
                 print(f"  !! {msg}")
     if not any_found:
-        print(f"  none found across {len(touched)} patched .c file(s) -- clean")
+        print("\n  No unresolved duplicates found.")
 
 
 def apply_hand_merges():
