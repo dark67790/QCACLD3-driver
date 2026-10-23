@@ -298,6 +298,123 @@ def _mutually_exclusive(path_a, path_b):
     return any(a_map[bid] != b_map[bid] for bid in shared)
 
 
+def _find_matching_paren(text: str, open_idx: int) -> int:
+    """text[open_idx] must be '('. Returns the index of its matching ')',
+    tracking nesting depth, or -1 if unbalanced before EOF."""
+    depth = 0
+    i = open_idx
+    n = len(text)
+    while i < n:
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _is_function_definition(text: str, open_paren_idx: int) -> bool:
+    """text[open_paren_idx] must be '('. A match is a genuine function
+    DEFINITION only if its parameter list's matching ')' is followed
+    (after only whitespace) by '{'. A call ends in ';' or ',' or ')'
+    inside a larger expression; a forward declaration ends in ';'.
+    Without this check, the duplicate-function scanner below false-flags
+    an ordinary call site (e.g. `hdd_monitor_mode_tx_inject(adapter, dev,
+    skb);`) as a second definition, since the scan regex only looks for
+    "name(" at the start of a non-comment line and doesn't care what
+    follows the closing paren."""
+    close_idx = _find_matching_paren(text, open_paren_idx)
+    if close_idx == -1:
+        return False
+    j = close_idx + 1
+    n = len(text)
+    while j < n and text[j] in " \t\r\n":
+        j += 1
+    return j < n and text[j] == "{"
+
+
+def _delete_function_by_doc_marker(path: Path, doc_marker: str, label: str) -> bool:
+    """Delete one complete function definition, located structurally
+    instead of by a literal transcription of its full body: find the
+    short, distinctive doc_marker inside its kernel-doc comment, walk
+    back to that comment's opening '/**', walk forward to the function's
+    opening '{', then brace-balance to the matching closing '}' and
+    delete everything from the comment through that brace (plus one
+    trailing blank line, if present).
+
+    This replaces a fragile literal-body fuzzy_replace for cases like
+    wlan_hdd_cfg80211_get_channel, where the body itself (not just its
+    surroundings) has already been shown to drift between snapshots --
+    a hand-transcribed anchor for the whole function keeps re-breaking
+    on each new divergence inside the body. Brace-matching is correct
+    regardless of what's inside, as long as the doc comment and a '{'
+    immediately following the signature are present -- true for every
+    kernel-doc-commented function in this codebase."""
+    ATTEMPTED_FILES.add(path.resolve())
+    if not path.exists():
+        FAILURES.append(f"[{label}] file not found: {path}")
+        return False
+
+    text = path.read_text()
+    marker_idx = text.find(doc_marker)
+    if marker_idx == -1:
+        print(f"[{label}] doc marker not present -- nothing to delete")
+        return False
+
+    comment_start = text.rfind("/**", 0, marker_idx)
+    if comment_start == -1:
+        FAILURES.append(
+            f"[{label}] found doc marker but no preceding '/**' in {path} "
+            f"-- refusing to guess, needs a human")
+        _diagnose(path, doc_marker)
+        return False
+
+    brace_open = text.find("{", marker_idx)
+    if brace_open == -1:
+        FAILURES.append(
+            f"[{label}] found doc marker but no following '{{' in {path} "
+            f"-- refusing to guess, needs a human")
+        _diagnose(path, doc_marker)
+        return False
+
+    brace_close = -1
+    depth = 0
+    i = brace_open
+    n = len(text)
+    while i < n:
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                brace_close = i
+                break
+        i += 1
+    if brace_close == -1:
+        FAILURES.append(
+            f"[{label}] opening brace at offset {brace_open} in {path} "
+            f"never balanced -- refusing to guess, needs a human")
+        return False
+
+    # Consume up to one trailing blank line after the closing brace so we
+    # don't leave a double blank line behind.
+    end = brace_close + 1
+    if text[end:end + 1] == "\n":
+        end += 1
+    if text[end:end + 1] == "\n":
+        end += 1
+
+    start_line = text.count("\n", 0, comment_start) + 1
+    end_line = text.count("\n", 0, end) + 1
+    new_text = text[:comment_start] + text[end:]
+    path.write_text(new_text)
+    print(f"[{label}] deleted function (lines {start_line}-{end_line}) -> "
+          f"{path.relative_to(REPO_ROOT)}")
+    return True
+
+
 def _diagnose_duplicate(path: Path, name: str, lines_list, context_lines: int = 24):
     """Dump real context around each occurrence of a duplicated function name,
     the same way _diagnose() does for a missed .rej anchor, so a genuine new
@@ -346,8 +463,17 @@ def scan_for_duplicate_functions():
             pattern = re.compile(
                 r"^(?!\s*[*/])(?:static[ \t]+)?(?:inline[ \t]+)?"
                 r"[\w \t\*]*?\b" + re.escape(name) + r"[ \t]*\(", re.M)
-            match_lines = [text.count("\n", 0, m.start()) + 1
-                           for m in pattern.finditer(text)]
+            # Pattern alone can't distinguish a definition from a call or a
+            # forward declaration -- "name(" at line-start matches a call
+            # like "hdd_monitor_mode_tx_inject(adapter, dev, skb);" just as
+            # readily as the real definition. Confirm each match's parameter
+            # list is followed by '{' (a definition) before counting it.
+            match_lines = []
+            for m in pattern.finditer(text):
+                open_paren_idx = m.end() - 1  # pattern consumes the '(' itself
+                if (text[open_paren_idx] == "("
+                        and _is_function_definition(text, open_paren_idx)):
+                    match_lines.append(text.count("\n", 0, m.start()) + 1)
             if len(match_lines) <= 1:
                 print(f"  ok  {name}  ({rel}) -- {len(match_lines)} occurrence(s)")
                 continue
@@ -693,85 +819,22 @@ def apply_hand_merges():
     #     userspace channel introspection), so deleting it outright is safe
     #     -- no need to port its mon_chan_freq fallback into the real fn.
     #
-    #     NOTE: ground-truth dump (DIAGNOSE) showed this tree's copy of the
-    #     function has two extra kernel-doc-style inline comments ("Primary
-    #     source: ..." / "Fallback: ...") between the `if (!adapter)` guard
-    #     and the switch block, that the original transcription of this
-    #     anchor omitted. Anchor below now matches lines 22803-22845 of
-    #     wlan_hdd_cfg80211.c verbatim, tabs included. ---
+    #     NOTE: after three rounds of a hand-transcribed full-body anchor
+    #     re-breaking on each newly-discovered internal divergence (first
+    #     the missing "Primary source"/"Fallback" comments, then another
+    #     mismatch further into the body that a 70-line diagnose window
+    #     couldn't even show), the literal-body approach was abandoned.
+    #     _delete_function_by_doc_marker() below finds this function
+    #     structurally -- by its doc comment, then brace-matching to the
+    #     closing '}' -- so it's correct no matter what the body contains. ---
     f = HDD_SRC / "wlan_hdd_cfg80211.c"
     patch_get_channel_marker = "so that tools like aireplay-ng / mdk3 can determine the current channel."
     if not already_present(f, patch_get_channel_marker):
         print("[cfg80211.c get_channel dedup] patch's duplicate not present -- skipping")
     else:
-        fuzzy_replace(f,
-            "/**\n"
-            " * wlan_hdd_cfg80211_get_channel() - Report current operating channel\n"
-            " * @wiphy: wiphy handle\n"
-            " * @wdev: wireless_dev handle\n"
-            " * @chandef: output channel definition\n"
-            " *\n"
-            " * Required by nl80211 (NL80211_CMD_GET_INTERFACE) and wext (SIOCGIWFREQ)\n"
-            " * so that tools like aireplay-ng / mdk3 can determine the current channel.\n"
-            " *\n"
-            " * Return: 0 on success, -ENODATA if no channel is set.\n"
-            " */\n"
-            "static int wlan_hdd_cfg80211_get_channel(struct wiphy *wiphy,\n"
-            "\t\t\t\t\t struct wireless_dev *wdev,\n"
-            "\t\t\t\t\t struct cfg80211_chan_def *chandef)\n"
-            "{\n"
-            "\tstruct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(wdev->netdev);\n"
-            "\tstruct hdd_station_ctx *sta_ctx;\n"
-            "\tstruct hdd_mon_set_ch_info *ch_info;\n"
-            "\tstruct ieee80211_channel *chan;\n"
-            "\tuint32_t freq;\n"
-            "\n"
-            "\tif (!adapter)\n"
-            "\t\treturn -ENODATA;\n"
-            "\n"
-            "\t/* Primary source: adapter->mon_chan_freq (set by both boot-time\n"
-            "\t * monitor mode and cfg80211 set_monitor_channel).\n"
-            "\t */\n"
-            "\tfreq = adapter->mon_chan_freq;\n"
-            "\n"
-            "\t/* Fallback: station context ch_info (set by hdd_mon_select_cbmode\n"
-            "\t * in the roam callback path).\n"
-            "\t */\n"
-            "\tif (!freq) {\n"
-            "\t\tsta_ctx = WLAN_HDD_GET_STATION_CTX_PTR(adapter);\n"
-            "\t\tch_info = &sta_ctx->ch_info;\n"
-            "\t\tfreq = ch_info->freq;\n"
-            "\t}\n"
-            "\n"
-            "\tif (!freq)\n"
-            "\t\treturn -ENODATA;\n"
-            "\n"
-            "\tchan = ieee80211_get_channel(wiphy, freq);\n"
-            "\tif (!chan)\n"
-            "\t\treturn -ENODATA;\n"
-            "\n"
-            "\tcfg80211_chandef_create(chandef, chan, NL80211_CHAN_NO_HT);\n"
-            "\n"
-            "\tswitch (adapter->mon_bandwidth) {\n"
-            "\tcase CH_WIDTH_40MHZ:\n"
-            "\t\tchandef->width = NL80211_CHAN_WIDTH_40;\n"
-            "\t\tbreak;\n"
-            "\tcase CH_WIDTH_80MHZ:\n"
-            "\t\tchandef->width = NL80211_CHAN_WIDTH_80;\n"
-            "\t\tbreak;\n"
-            "\tcase CH_WIDTH_160MHZ:\n"
-            "\t\tchandef->width = NL80211_CHAN_WIDTH_160;\n"
-            "\t\tbreak;\n"
-            "\tdefault:\n"
-            "\t\tbreak;\n"
-            "\t}\n"
-            "\n"
-            "\treturn 0;\n"
-            "}\n"
-            "\n",
-            "",
-            "cfg80211.c remove duplicate get_channel",
-            diagnose_needle=patch_get_channel_marker)
+        _delete_function_by_doc_marker(
+            f, patch_get_channel_marker,
+            "cfg80211.c remove duplicate get_channel")
 
         # Drop one of the two identical .get_channel = ... designated
         # initializers in wlan_hdd_cfg80211_ops (disambiguate via the
