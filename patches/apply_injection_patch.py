@@ -646,7 +646,6 @@ def apply_hand_merges():
         print("[cfg80211.c get_channel dedup] patch's duplicate not present -- skipping")
     else:
         fuzzy_replace(f,
-            "#ifdef FEATURE_MONITOR_MODE_SUPPORT\n"
             "/**\n"
             " * wlan_hdd_cfg80211_get_channel() - Report current operating channel\n"
             " * @wiphy: wiphy handle\n"
@@ -705,7 +704,7 @@ def apply_hand_merges():
             "\treturn 0;\n"
             "}\n"
             "\n",
-            "#ifdef FEATURE_MONITOR_MODE_SUPPORT\n",
+            "",
             "cfg80211.c remove duplicate get_channel",
             diagnose_needle=patch_get_channel_marker)
 
