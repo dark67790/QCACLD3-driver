@@ -832,9 +832,42 @@ def cleanup():
               f"(see FAILED list below if any were never addressed)")
 
 
+def diagnose_qca_vendor_enum():
+    """Dump real, CI-fresh context around the ANT_DIV enum block and the
+    QCA_WLAN_VENDOR_ATTR_CONFIG_MAX computation in qca_vendor.h. This file's
+    hunk has behaved inconsistently across runs (sometimes fuzzy-succeeds,
+    sometimes fails outright), and a build error showed the patch's new
+    ANT_DIV_PROBE_COUNT_WLAN..SWITCH_BT_RSSI_DIFF constants resolving to
+    124-129 while the array they index only has 82 slots -- meaning MAX
+    wasn't bumped to match wherever those new members actually landed.
+    Printed from THIS run's actual tree, not a possibly-stale local one."""
+    f = WLAN_DIR / "qca-wifi-host-cmn/os_if/linux/qca_vendor.h"
+    print(f"\n{'=' * 60}\nDIAGNOSING qca_vendor.h ANT_DIV / MAX enum state\n{'=' * 60}")
+    if not f.exists():
+        print(f"  (file not found: {f})")
+        return
+    text = f.read_text()
+    for marker in (
+        "QCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_ACK_SNR_WEIGHT",
+        "QCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_PROBE_COUNT_WLAN",
+        "QCA_WLAN_VENDOR_ATTR_CONFIG_AFTER_LAST",
+        "QCA_WLAN_VENDOR_ATTR_CONFIG_MAX",
+    ):
+        idx = text.find(marker)
+        if idx == -1:
+            print(f"  '{marker}' -- NOT FOUND anywhere in file")
+            continue
+        line_no = text.count("\n", 0, idx) + 1
+        print(f"  '{marker}' found at line {line_no}")
+    print()
+    _diagnose(f, "QCA_WLAN_VENDOR_ATTR_CONFIG_ANT_DIV_ACK_SNR_WEIGHT", context_lines=50)
+    _diagnose(f, "QCA_WLAN_VENDOR_ATTR_CONFIG_AFTER_LAST", context_lines=20)
+
+
 def main():
     run_bulk_patch()
     dump_rejects()
+    diagnose_qca_vendor_enum()
     apply_hand_merges()
     check_unaddressed_rejects()
     scan_for_duplicate_functions()
