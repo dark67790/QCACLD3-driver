@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 apply_injection_patch.py
@@ -288,9 +287,14 @@ def scan_for_duplicate_functions():
             continue
         text = target.read_text()
         for name in sorted(names):
+            # (?!\s*[*/]) excludes comment lines -- kernel doc convention
+            # writes "* funcname() - description" which would otherwise
+            # false-match. [\w \t\*]  (not \s) keeps the flexible middle
+            # portion from crossing newlines, since \s matches '\n' too
+            # and would otherwise let this bridge into unrelated lines.
             pattern = re.compile(
-                r"^(?:static\s+)?(?:inline\s+)?[\w\s\*]*?\b" +
-                re.escape(name) + r"\s*\(", re.M)
+                r"^(?!\s*[*/])(?:static[ \t]+)?(?:inline[ \t]+)?"
+                r"[\w \t\*]*?\b" + re.escape(name) + r"[ \t]*\(", re.M)
             match_lines = [text.count("\n", 0, m.start()) + 1
                            for m in pattern.finditer(text)]
             if len(match_lines) <= 1:
